@@ -1,0 +1,57 @@
+name: Deploy Documentation to GitHub Pages
+
+on:
+  push:
+    paths-ignore:
+      - 'pronote-standalone-runner/**'
+      - '.github/workflows/pronote-runner.yml'
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages-doc
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Build Vite SPA
+        run: npx vite build --base=./
+
+      - name: Copy Documentation Assets
+        run: |
+          cp docs/index.html dist/standalone.html || true
+          cp docs/index.html dist/docs.html || true
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './dist'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

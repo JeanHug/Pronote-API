@@ -1,0 +1,6 @@
+{
+  "name": "Puppeteer Pronote ENT Scraper",
+  "description": "Automatisation Puppeteer serveur pour s'authentifier sur l'ENT Seine-et-Marne et extraire en direct les données JSON complètes de Pronote (Emploi du temps annuel, Notes et moyennes, Agenda, Contenus et ressources) avec navigateur en direct et affichage clair.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

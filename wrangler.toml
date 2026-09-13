@@ -1,0 +1,11 @@
+# wrangler.toml
+name = "pronote-api"
+main = "worker.js"
+compatibility_date = "2024-03-01"
+
+kv_namespaces = [
+  { binding = "PRONOTE_KV", id = "f8c1c429c7564ddb927a5fa2f4f5a107" }
+]
+
+[vars]
+GITHUB_API_TOKEN = ""
