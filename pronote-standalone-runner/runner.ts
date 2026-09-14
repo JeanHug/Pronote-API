@@ -1,298 +1,355 @@
-import express from 'express';
-import cors from 'cors';
-import { runPronotePuppeteerScrape } from './puppeteerScraper.ts';
+/**
+ * RUNNER PRONOTE — BOUCLE D'EXTRACTION
+ * ====================================
+ * Tourne dans une VM GitHub Actions. Récupère les jobs auprès du Worker, les
+ * exécute avec Puppeteer, renvoie la réponse assainie.
+ *
+ * Corrections par rapport à l'ancienne version :
+ *
+ *  - `WORKER_URL` est réellement LUE depuis l'environnement (elle était
+ *    transmise par le workflow puis ignorée par le code, qui la codait en dur).
+ *  - Le relais ne déclenche plus le run DEUX fois (deux canaux concurrents qui
+ *    s'annulaient mutuellement par le jeu de `cancel-in-progress`).
+ *  - La logique de fin de session n'est plus court-circuitée par le garde de
+ *    concurrence : elle était placée APRÈS un `return` anticipé, donc le relais
+ *    et la sortie propre étaient inatteignables dès que 3 jobs tournaient.
+ *  - Plus aucun mot de passe n'est publié (l'ancien code postait le job complet
+ *    en commentaire d'une issue PUBLIQUE et le supprimait après coup, alors que
+ *    le flux RSS, les notifications e-mail et les webhooks l'avaient déjà
+ *    diffusé).
+ *  - Plus de polling GitHub toutes les 800 ms (4 500 requêtes/h pour une limite
+ *    de 5 000) : la file est désormais interrogée directement sur le Worker,
+ *    via un Durable Object à cohérence forte. Le canal GitHub de secours a été
+ *    supprimé : il contournait une latence qui n'existe plus.
+ *  - Le serveur Express de santé a été retiré : une VM GitHub Actions n'expose
+ *    aucun port entrant, ce service n'était joignable par personne.
+ *  - Les erreurs sont journalisées au lieu d'être avalées par `catch (_) {}`.
+ */
 
-const GITHUB_TOKEN = process.env.GH_TOKEN || process.env.GH_RUNNER_TOKEN || process.env.GITHUB_TOKEN || '';
-const REPO_OWNER = process.env.OWNE || process.env.OWNER || process.env.GITHUB_OWNER || 'JeanHug';
-const REPO_NAME = process.env.REPO || process.env.GITHUB_REPO || 'Pronote-API';
-const ISSUE_NUMBER = 1;
-const WORKER_URL = 'https://pronote-api.hugdu77777.workers.dev';
+import { runScrape, closeBrowser } from './scraper.ts';
+import type { ErrorCode } from '../src/pronote/types.ts';
 
-const SESSION_MAX_DURATION_MS = 5 * 60 * 60 * 1000 - 4 * 60 * 1000; // ~4h56m total session duration
-const RELAY_TRIGGER_LEAD_TIME_MS = 5 * 60 * 1000; // Trigger next runner 5 minutes before expiration
-const sessionStartTime = Date.now();
-const sessionExpiresAt = sessionStartTime + SESSION_MAX_DURATION_MS;
-let relayTriggered = false;
+// ---------------------------------------------------------------------------
+// Configuration — toutes les valeurs viennent de l'environnement
+// ---------------------------------------------------------------------------
+
+function env(name: string, fallback = ''): string {
+  return process.env[name]?.trim() || fallback;
+}
+
+/** URL du Worker. Plus de valeur codée en dur : le workflow fait foi. */
+const WORKER_URL = env('WORKER_URL').replace(/\/$/, '');
+/** Token partagé avec le Worker, qui authentifie les endpoints runner. */
+const RUNNER_TOKEN = env('RUNNER_TOKEN') || env('GH_TOKEN');
+const RUNNER_ID = env('GITHUB_RUN_ID', 'local') + '-' + env('GITHUB_RUN_ATTEMPT', '1');
+
+const SESSION_MAX_MS = 5 * 60 * 60 * 1000 - 3 * 60 * 1000; // 4 h 57
+const RELAY_LEAD_MS = 4 * 60 * 1000;                        // relais à T-4 min
+const POLL_INTERVAL_MS = 300;
+const POLL_BACKOFF_MAX_MS = 5_000;
+const MAX_CONCURRENT_JOBS = 2;                              // 2 jobs × 6 onglets = 12 max
+const HEARTBEAT_INTERVAL_MS = 15_000;
+
+const sessionStart = Date.now();
+const sessionExpiresAt = sessionStart + SESSION_MAX_MS;
+
+// ---------------------------------------------------------------------------
+// Journalisation — jamais de secret, identifiants masqués
+// ---------------------------------------------------------------------------
 
 const recentLogs: string[] = [];
-function log(msg: string) {
-  const line = `[${new Date().toISOString().substring(11, 19)}] ${msg}`;
+
+function log(msg: string): void {
+  const line = `[${new Date().toISOString().slice(11, 19)}] ${msg}`;
   console.log(line);
   recentLogs.push(line);
-  if (recentLogs.length > 50) recentLogs.shift();
+  if (recentLogs.length > 40) recentLogs.shift();
 }
 
-log('----------------------------------------------------');
-log('🚀 PRONOTE ACTIONS 5H CONTINUOUS RUNNER STARTED');
-log(`⏱ Maximum Session Duration: 5 Hours`);
-log(`🎯 Target Worker: ${WORKER_URL}`);
-log('----------------------------------------------------');
+function fatal(msg: string): never {
+  log(`ERREUR FATALE : ${msg}`);
+  process.exit(1);
+}
 
-// Initialize local express health server
-const app = express();
-app.use(cors());
-app.use(express.json());
+if (!WORKER_URL) fatal('WORKER_URL non défini. Le runner ne peut pas savoir où envoyer ses résultats.');
+if (!RUNNER_TOKEN) fatal('RUNNER_TOKEN (ou GH_TOKEN) non défini. Les endpoints runner sont authentifiés : sans token, tout appel sera refusé en 401.');
 
-app.get('/health', (_req, res) => {
-  res.json({
-    status: 'online',
-    runnerId: process.env.GITHUB_RUN_ID || 'standalone-gh-runner',
-    uptimeMs: Date.now() - sessionStartTime,
-    expiresInMs: sessionExpiresAt - Date.now(),
-    logs: recentLogs.slice(-20)
-  });
-});
+// ---------------------------------------------------------------------------
+// Client Worker
+// ---------------------------------------------------------------------------
 
-app.listen(3000, () => {
-  log('📡 Runner health server listening on port 3000');
-});
+interface JobMessage {
+  jobId: string;
+  username: string;
+  password: string;
+  pronoteUrl: string;
+  entUrl: string;
+  format: 'json' | 'html';
+}
 
-// Send periodic Heartbeat to Cloudflare Worker
-async function sendHeartbeat() {
+async function workerFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 20_000);
   try {
-    await fetch(`${WORKER_URL}/api/runner/heartbeat`, {
+    return await fetch(`${WORKER_URL}${path}`, {
+      ...init,
+      signal: ctrl.signal,
+      headers: {
+        'Authorization': `Bearer ${RUNNER_TOKEN}`,
+        'Content-Type': 'application/json',
+        'User-Agent': `Pronote-Runner/${RUNNER_ID}`,
+        ...(init.headers ?? {}),
+      },
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat
+// ---------------------------------------------------------------------------
+
+let heartbeatFailures = 0;
+
+async function heartbeat(): Promise<void> {
+  try {
+    const res = await workerFetch('/api/v1/runner/heartbeat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        runnerId: RUNNER_ID,
         status: 'running',
-        runnerId: process.env.GITHUB_RUN_ID || 'standalone-gh-runner',
-        startedAt: sessionStartTime,
+        startedAt: sessionStart,
         sessionExpiresAt,
         lastPing: Date.now(),
-        logs: recentLogs.slice(-15)
-      })
+        logs: recentLogs.slice(-15),
+      }),
     });
-  } catch (err: any) {
-    console.error('Heartbeat error:', err?.message);
+    heartbeatFailures = 0;
+    if (!res.ok) {
+      log(`Heartbeat refusé (HTTP ${res.status}).`);
+    }
+  } catch (err) {
+    heartbeatFailures++;
+    // On journalise : l'ancien code avalait ces erreurs, ce qui masquait
+    // complètement une panne de connectivité avec le Worker.
+    if (heartbeatFailures === 1 || heartbeatFailures % 10 === 0) {
+      log(`Heartbeat en échec (${heartbeatFailures}×) : ${(err as Error).message}`);
+    }
   }
 }
 
-// Trigger replacement 5h runner VM via GitHub REST API
-async function triggerNextRunnerRelay() {
+// ---------------------------------------------------------------------------
+// Relais de session — UN SEUL canal de déclenchement
+// ---------------------------------------------------------------------------
+
+let relayTriggered = false;
+
+/**
+ * Déclenche le prochain run de 5 h.
+ *
+ * L'ancienne version appelait l'API GitHub via DEUX canaux (workflow_dispatch
+ * puis repository_dispatch), créant deux runs dans le même groupe de
+ * concurrence : le second annulait le premier. Le workflow, lui, en ajoutait un
+ * troisième via `curl`. Un seul dispatch suffit.
+ */
+async function triggerRelay(): Promise<void> {
   if (relayTriggered) return;
   relayTriggered = true;
-  log('🔄 [5h Relay] Triggering next GitHub Actions 5-hour runner VM before current session expires...');
+  log('Relais : déclenchement de la session suivante.');
 
   try {
-    const wfRes = await fetch(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/actions/workflows/pronote-runner.yml/dispatches`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${GITHUB_TOKEN}`,
-        'Accept': 'application/vnd.github.v3+json',
-        'User-Agent': 'Pronote-Runner-5h'
-      },
-      body: JSON.stringify({ ref: 'main' })
-    });
-
-    if (wfRes.ok || wfRes.status === 204) {
-      log('✅ [5h Relay] Replacement runner successfully dispatched via workflow_dispatch!');
+    const res = await workerFetch('/api/v1/runner/relay', { method: 'POST', body: JSON.stringify({ reason: 'session_rotation' }) });
+    if (res.ok) {
+      log('Relais accepté par le Worker.');
+    } else {
+      log(`Relais refusé (HTTP ${res.status}).`);
     }
-
-    const res = await fetch(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/dispatches`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${GITHUB_TOKEN}`,
-        'Accept': 'application/vnd.github.v3+json',
-        'User-Agent': 'Pronote-Runner-5h'
-      },
-      body: JSON.stringify({
-        event_type: 'start_runner',
-        client_payload: { reason: '5h_session_rotation', triggeredAt: Date.now() }
-      })
-    });
-
-    if (res.ok || res.status === 204) {
-      log('✅ [5h Relay] Replacement runner successfully dispatched via repository_dispatch!');
-    }
-  } catch (err: any) {
-    log(`❌ [5h Relay] Network error triggering replacement runner: ${err?.message}`);
+  } catch (err) {
+    log(`Relais impossible : ${(err as Error).message}`);
   }
 }
 
-sendHeartbeat();
-setInterval(sendHeartbeat, 12000);
+// ---------------------------------------------------------------------------
+// Traitement d'un job
+// ---------------------------------------------------------------------------
 
-// Job tracking
-const processedJobIds = new Set<string>();
-let lastGithubCheckMs = 0;
-let activeJobsCount = 0;
-const MAX_CONCURRENT_JOBS = 3;
+const processedJobs = new Set<string>();
+let activeJobs = 0;
 
-// High-speed job polling & session lifecycle manager
-async function pollJobQueue() {
-  if (activeJobsCount >= MAX_CONCURRENT_JOBS) {
-    return;
-  }
+async function handleJob(job: JobMessage): Promise<void> {
+  activeJobs++;
+  const t0 = Date.now();
+  log(`Job ${job.jobId} démarré (format: ${job.format}).`);
 
-  const now = Date.now();
-  const timeRemainingMs = sessionExpiresAt - now;
-
-  if (timeRemainingMs <= RELAY_TRIGGER_LEAD_TIME_MS && !relayTriggered) {
-    await triggerNextRunnerRelay();
-  }
-
-  if (now >= sessionExpiresAt && activeJobsCount === 0) {
-    log('⏳ 5-Hour session completed. Gracefully exiting current runner VM.');
-    process.exit(0);
-  }
-
-  // 1. Fast polling directly from Cloudflare Worker KV (<50ms latency)
   try {
-    const kvRes = await fetch(`${WORKER_URL}/api/runner/poll-job`, {
-      headers: { 'User-Agent': 'Pronote-Runner-5h' }
+    const outcome = await runScrape({
+      username: job.username,
+      password: job.password,
+      pronoteUrl: job.pronoteUrl,
+      entUrl: job.entUrl,
+      format: job.format,
+      onLog: (m) => log(`[${job.jobId}] ${m}`),
     });
-    if (kvRes.ok) {
-      const kvData = await kvRes.json() as any;
-      if (kvData && kvData.hasJob && kvData.job && kvData.job.jobId) {
-        if (!processedJobIds.has(kvData.job.jobId)) {
-          processedJobIds.add(kvData.job.jobId);
-          log(`⚡ [Instant KV Intercept] Job received: ${kvData.job.jobId} for ${kvData.job.username}`);
-          handleScrapeJob(kvData.job).catch((e) => log(`Job error: ${e?.message}`));
-          return;
-        }
-      }
+
+    const elapsed = Date.now() - t0;
+
+    const payload = outcome.payload
+      ? { ...outcome.payload, jobId: job.jobId }
+      : {
+          jobId: job.jobId,
+          success: false,
+          status: 'error' as const,
+          executionTimeMs: elapsed,
+          timestamp: new Date().toISOString(),
+          errorCode: outcome.errorCode ?? ('SCRAPER_ERROR' as ErrorCode),
+          error: outcome.error ?? 'Erreur inconnue.',
+        };
+
+    const res = await workerFetch('/api/v1/runner/job-result', {
+      method: 'POST',
+      body: JSON.stringify({
+        jobId: job.jobId,
+        success: outcome.success,
+        errorCode: outcome.errorCode,
+        payload: JSON.stringify(payload),
+      }),
+    });
+
+    if (res.ok) {
+      log(`Job ${job.jobId} transmis (${(elapsed / 1000).toFixed(2)} s, succès: ${outcome.success}).`);
+    } else {
+      log(`Job ${job.jobId} : transmission refusée (HTTP ${res.status}).`);
     }
-  } catch (_) {
-    // Continue
+  } catch (err) {
+    const elapsed = Date.now() - t0;
+    log(`Job ${job.jobId} en exception (${elapsed} ms) : ${(err as Error).message}`);
+
+    await workerFetch('/api/v1/runner/job-result', {
+      method: 'POST',
+      body: JSON.stringify({
+        jobId: job.jobId,
+        success: false,
+        errorCode: 'SCRAPER_ERROR',
+        payload: JSON.stringify({
+          jobId: job.jobId,
+          success: false,
+          status: 'error',
+          executionTimeMs: elapsed,
+          timestamp: new Date().toISOString(),
+          errorCode: 'SCRAPER_ERROR',
+          error: 'Erreur interne du runner lors du scraping.',
+        }),
+      }),
+    }).catch(() => null);
+  } finally {
+    activeJobs--;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Boucle principale
+// ---------------------------------------------------------------------------
+
+let stopping = false;
+
+async function shutdown(reason: string): Promise<void> {
+  if (stopping) return;
+  stopping = true;
+  log(`Arrêt demandé (${reason}). Jobs actifs : ${activeJobs}.`);
+
+  // On laisse les jobs en cours se terminer : l'ancienne architecture les
+  // perdait systématiquement, l'annulation tombant au milieu du scraping.
+  const deadline = Date.now() + 90_000;
+  while (activeJobs > 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 500));
   }
 
-  // 2. Fallback check on GitHub Issue comments (Every 800ms)
-  if (now - lastGithubCheckMs > 800) {
-    lastGithubCheckMs = now;
+  await closeBrowser().catch(() => null);
+  log('Runner arrêté proprement.');
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+process.on('SIGINT', () => { void shutdown('SIGINT'); });
+process.on('unhandledRejection', (r) => log(`Promesse rejetée non gérée : ${String(r)}`));
+process.on('uncaughtException', (e) => log(`Exception non capturée : ${e.message}`));
+
+async function mainLoop(): Promise<void> {
+  let consecutiveErrors = 0;
+
+  // La boucle ne sort JAMAIS par exception : elle journalise et continue.
+  // L'ancienne version enveloppait tout dans `try { … } catch (_) {}`, si bien
+  // qu'une panne permanente faisait tourner le runner 5 h en ne faisant RIEN,
+  // sans un seul message d'erreur.
+  for (;;) {
     try {
-      const res = await fetch(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/comments`, {
-        headers: {
-          'Authorization': `Bearer ${GITHUB_TOKEN}`,
-          'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': 'Pronote-Runner-5h'
-        }
+      // --- Fin de session : vérifiée AVANT le garde de concurrence, qui la
+      //     rendait inatteignable dès que 3 jobs tournaient (bug d'origine).
+      const now = Date.now();
+      if (now >= sessionExpiresAt && activeJobs === 0) {
+        log('Durée de session atteinte.');
+        break;
+      }
+      if (sessionExpiresAt - now <= RELAY_LEAD_MS && !relayTriggered) {
+        await triggerRelay();
+      }
+
+      if (activeJobs >= MAX_CONCURRENT_JOBS) {
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+        continue;
+      }
+
+      const res = await workerFetch('/api/v1/runner/next-job', {
+        method: 'POST',
+        body: JSON.stringify({ runnerId: RUNNER_ID }),
       });
 
-      if (res.status === 200) {
-        const comments = await res.json() as any[];
-        for (const comment of comments) {
-          let jobPayload: any = null;
-          try {
-            jobPayload = JSON.parse(comment.body);
-          } catch (_) {
-            continue;
-          }
-
-          if (jobPayload && jobPayload.jobId && jobPayload.type === 'scrape_job') {
-            if (processedJobIds.has(jobPayload.jobId)) continue;
-            processedJobIds.add(jobPayload.jobId);
-
-            log(`⚡ [Instant Issue Intercept] Job received: ${jobPayload.jobId} for ${jobPayload.username}`);
-            
-            fetch(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/issues/comments/${comment.id}`, {
-              method: 'DELETE',
-              headers: {
-                'Authorization': `Bearer ${GITHUB_TOKEN}`,
-                'User-Agent': 'Pronote-Runner-5h'
-              }
-            }).catch(() => null);
-
-            handleScrapeJob(jobPayload).catch((e) => log(`Job error: ${e?.message}`));
-            break;
-          }
-        }
+      if (!res.ok) {
+        throw new Error(`next-job a répondu HTTP ${res.status}`);
       }
-    } catch (_) {
-      // Continue
+
+      const data = await res.json<{ hasJob: boolean; job?: JobMessage }>();
+      consecutiveErrors = 0;
+
+      if (data.hasJob && data.job && !processedJobs.has(data.job.jobId)) {
+        processedJobs.add(data.job.jobId);
+        // Purge bornée : l'ancienne version laissait la Set croître sans limite.
+        if (processedJobs.size > 5_000) {
+          const first = processedJobs.values().next().value;
+          if (first) processedJobs.delete(first);
+        }
+        void handleJob(data.job);
+      }
+
+    } catch (err) {
+      consecutiveErrors++;
+      const backoff = Math.min(POLL_INTERVAL_MS * 2 ** Math.min(consecutiveErrors, 5), POLL_BACKOFF_MAX_MS);
+      if (consecutiveErrors === 1 || consecutiveErrors % 20 === 0) {
+        log(`Erreur de boucle (${consecutiveErrors}×) : ${(err as Error).message} — nouvel essai dans ${backoff} ms.`);
+      }
+      await new Promise((r) => setTimeout(r, backoff));
     }
+
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
   }
+
+  await shutdown('fin de session');
 }
 
-// Job processing with isolated browser context
-async function handleScrapeJob(job: any) {
-  const { jobId, username, password, pronoteUrl, entUrl, format } = job;
-  log(`[${jobId}] Lancement du scraping (${format || 'json'}) pour ${username}...`);
-  const t0 = Date.now();
-  activeJobsCount++;
+// ---------------------------------------------------------------------------
+// Démarrage
+// ---------------------------------------------------------------------------
 
-  try {
-    const result = await runPronotePuppeteerScrape(
-      username,
-      password,
-      pronoteUrl || 'https://0771068t.index-education.net/pronote/eleve.html',
-      entUrl || 'https://ent.seine-et-marne.fr/',
-      format || 'json'
-    );
+log('──────────────────────────────────────────────');
+log('PRONOTE RUNNER DÉMARRÉ');
+log(`  Worker       : ${WORKER_URL}`);
+log(`  Runner ID    : ${RUNNER_ID}`);
+log(`  File d'attente: Durable Object (cohérence forte, KV supprimé)`);
+log(`  Fin session  : ${new Date(sessionExpiresAt).toISOString()}`);
+log('──────────────────────────────────────────────');
 
-    const elapsed = Date.now() - t0;
-    log(`[${jobId}] Extraction achevée en ${elapsed}ms (${(elapsed/1000).toFixed(2)}s) - Succès: ${result.success}`);
+await heartbeat();
+setInterval(() => { void heartbeat(); }, HEARTBEAT_INTERVAL_MS);
 
-    const resultPayload = {
-      type: 'scrape_result',
-      jobId,
-      success: result.success,
-      format: format || 'json',
-      data: result.data,
-      html: result.html,
-      rawHtml: result.rawHtml,
-      error: result.error,
-      executionTimeMs: elapsed,
-      timestamp: new Date().toISOString()
-    };
-
-    // Push on both channels concurrently without blocking
-    await Promise.allSettled([
-      fetch(`${WORKER_URL}/api/runner/result`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(resultPayload)
-      }),
-      fetch(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/comments`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${GITHUB_TOKEN}`,
-          'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': 'Pronote-Runner-5h'
-        },
-        body: JSON.stringify({ body: JSON.stringify(resultPayload) })
-      })
-    ]);
-
-    log(`[${jobId}] Résultat transmis instantanément sur les 2 canaux (Worker KV + Issue).`);
-  } catch (scrapeErr: any) {
-    const elapsed = Date.now() - t0;
-    log(`[${jobId}] Erreur scraping (${elapsed}ms): ${scrapeErr?.message}`);
-    const errPayload = {
-      type: 'scrape_result',
-      jobId,
-      success: false,
-      error: scrapeErr?.message || 'Erreur inconnue lors du scraping',
-      executionTimeMs: elapsed,
-      timestamp: new Date().toISOString()
-    };
-
-    await Promise.allSettled([
-      fetch(`${WORKER_URL}/api/runner/result`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(errPayload)
-      }),
-      fetch(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/issues/${ISSUE_NUMBER}/comments`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${GITHUB_TOKEN}`,
-          'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': 'Pronote-Runner-5h'
-        },
-        body: JSON.stringify({ body: JSON.stringify(errPayload) })
-      })
-    ]);
-  } finally {
-    activeJobsCount--;
-  }
-}
-
-// Boucle récursive cadencée à 250ms
-async function runSequentialPollingLoop() {
-  try {
-    await pollJobQueue();
-  } catch (_) {}
-  setTimeout(runSequentialPollingLoop, 250);
-}
-
-runSequentialPollingLoop();
+await mainLoop();

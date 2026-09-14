@@ -1,41 +1,30 @@
 {
-  "name": "react-example",
+  "name": "pronote-api",
+  "version": "4.0.0",
   "private": true,
-  "version": "0.0.0",
   "type": "module",
+  "description": "API REST pour Pronote : emploi du temps, notes, devoirs, ressources et vie scolaire, en JSON structuré et documenté.",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
-    "start": "node dist/server.cjs",
-    "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "test": "tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run test",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build:docs": "tsx scripts/build-docs.ts",
+    "runner": "tsx pronote-standalone-runner/runner.ts"
   },
   "dependencies": {
-    "@google/genai": "^2.4.0",
-    "@tailwindcss/vite": "^4.1.14",
-    "@vitejs/plugin-react": "^5.0.4",
-    "cheerio": "^1.2.0",
-    "cors": "^2.8.6",
-    "dotenv": "^17.2.3",
-    "express": "^4.21.2",
-    "lucide-react": "^0.546.0",
-    "motion": "^12.23.24",
-    "pawnote": "^1.6.2",
-    "puppeteer": "^25.10.0",
-    "react": "^19.0.1",
-    "react-dom": "^19.0.1",
-    "vite": "^6.2.3"
+    "cheerio": "^1.0.0",
+    "puppeteer": "^24.10.0"
   },
   "devDependencies": {
-    "@types/cors": "^2.8.19",
-    "@types/express": "^4.17.21",
+    "@cloudflare/workers-types": "^5.20260911.1",
     "@types/node": "^22.14.0",
-    "autoprefixer": "^10.4.21",
-    "esbuild": "^0.25.0",
-    "tailwindcss": "^4.1.14",
-    "tsx": "^4.21.0",
-    "typescript": "~5.8.2",
-    "vite": "^6.2.3"
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.20.0"
   }
 }
