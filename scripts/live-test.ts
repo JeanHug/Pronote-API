@@ -108,6 +108,7 @@ function rapportPublic(
 async function main(): Promise<void> {
   const t0 = Date.now();
   let apiReponse: unknown = null;
+  let apiDeployee: { url: string; version: string | null; interface: string } | null = null;
   let resultatDirect: Awaited<ReturnType<typeof runScrape>> | null = null;
 
   // -------------------------------------------------------------------------
@@ -155,10 +156,37 @@ async function main(): Promise<void> {
     console.log('');
     console.log('── Appel de l\'API déployée ───────────────────────');
     try {
+      const base = API_BASE.replace(/\/$/, '');
+
+      // Quelle version est réellement en ligne ? Le déploiement peut être en
+      // retard sur le code : taper sur /api/v1/ d'une API restée en v3 renvoie
+      // un 404 trompeur, qui laisserait croire à un bug du client.
+      const sonder = async (chemin: string) => {
+        try {
+          const r = await fetch(`${base}${chemin}`, { signal: AbortSignal.timeout(15_000) });
+          return r.ok ? await r.json() as { version?: string } : null;
+        } catch { return null; }
+      };
+      const santeV4 = await sonder('/api/v1/health');
+      const santeV3 = santeV4 ? null : await sonder('/api/health');
+      const version = santeV4?.version ?? santeV3?.version ?? null;
+      const prefixe = santeV4 ? '/api/v1' : '';
+      apiDeployee = {
+        url: base,
+        version,
+        interface: santeV4 ? 'v4 (Durable Object)' : santeV3 ? 'v3 (KV, obsolète)' : 'inconnue',
+      };
+      console.log(`Version en ligne : ${version ?? 'inconnue'} — ${apiDeployee.interface}`);
+      if (santeV3) {
+        console.log('⚠️  L\'API déployée est une version ANTÉRIEURE au correctif :');
+        console.log('   elle utilise encore Cloudflare KV. Les mesures ci-dessous ne');
+        console.log('   portent donc PAS sur le code de ce dépôt.');
+      }
+
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 120_000);
 
-      const res = await fetch(`${API_BASE.replace(/\/$/, '')}/api/v1/scrape-pronote`, {
+      const res = await fetch(`${base}${prefixe}/scrape-pronote`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         // Le corps n'est jamais journalisé.
@@ -182,7 +210,9 @@ async function main(): Promise<void> {
         console.log(`Job ${r.jobId} en cours, suivi automatique…`);
         for (let i = 0; i < 60; i++) {
           await new Promise((x) => setTimeout(x, 3000));
-          const jr = await fetch(`${API_BASE.replace(/\/$/, '')}/api/v1/job/${encodeURIComponent(r.jobId)}`);
+          const jr = await fetch(`${base}${prefixe}/job/${encodeURIComponent(r.jobId)}`, {
+            signal: AbortSignal.timeout(20_000),
+          });
           if (jr.status !== 202) {
             apiReponse = await jr.json();
             console.log(`Résultat obtenu après ${i + 1} interrogation(s).`);
@@ -206,7 +236,11 @@ async function main(): Promise<void> {
 
   writeFileSync(
     'rapports/rapport-public.json',
-    JSON.stringify({ ...rapport, reponseApi: apiReponse ? assainirReponseApi(apiReponse) : null }, null, 2),
+    JSON.stringify({
+      ...rapport,
+      apiDeployee,
+      reponseApi: apiReponse ? assainirReponseApi(apiReponse) : null,
+    }, null, 2),
     'utf8',
   );
 
@@ -215,6 +249,7 @@ async function main(): Promise<void> {
     writeFileSync(
       'rapports/reponse-complete.json',
       JSON.stringify({
+        apiDeployee,
         reponseApi: apiReponse,
         extractionDirecte: resultatDirect.payload ?? null,
       }, null, 2),
