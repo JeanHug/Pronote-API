@@ -1,9 +1,20 @@
 node_modules/
-build/
 dist/
+_site/
 coverage/
 .DS_Store
 *.log
-.env*
+.env
+.env.*
 !.env.example
 .wrangler/
+.dev.vars
+.venv/
+
+# Rapports de test live : ils peuvent contenir des données d'élève.
+# Ne doivent JAMAIS être commités.
+rapports/
+*.rapport.json
+
+# Documentation générée (produite par scripts/build-docs.ts)
+docs/index.html

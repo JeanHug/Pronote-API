@@ -1,241 +1,214 @@
-# 🎓 Pronote REST API (Connexion ENT Automatisée)
+# Pronote API
 
-> **La première API REST autonome, ultra-rapide (~15s) et sans serveur résidentiel pour Pronote via ENT (Seine-et-Marne 77 & national).**  
-> Extraction complète en direct par **5 onglets parallèles** : **Profil Élève, Emploi du temps, Notes & Moyennes, Cahier de textes (Devoirs) et Ressources de cours** sous forme de JSON structuré propre et réel.
+API REST qui extrait l'emploi du temps, les notes, les devoirs, les ressources et la vie scolaire d'un élève Pronote, et les renvoie en JSON structuré et documenté.
 
-[![Status](https://img.shields.io/badge/Status-Op%C3%A9rationnel%2024%2F7-emerald?style=flat-square)](#)
-[![Performance](https://img.shields.io/badge/Performance-~15s%20(5%20onglets%20parall%C3%A8les)-blue?style=flat-square)](#)
-[![Architecture](https://img.shields.io/badge/Architecture-Double%20Canal%20(KV%20%2B%20Issues)-purple?style=flat-square)](#)
-[![License](https://img.shields.io/badge/License-MIT-slate?style=flat-square)](#)
+**Architecture :** Cloudflare Worker (edge) → Durable Object à cohérence forte → runner GitHub Actions (navigateur Puppeteer).
 
 ---
 
-## 🌐 Endpoints Officiels & URL de Production
+## Ce qui a changé (v4)
 
-| Service | URL | Méthode | Description |
-| :--- | :--- | :--- | :--- |
-| **Passerelle Principale** | `https://pronote-api.hugdu77777.workers.dev/api/scrape-pronote` | `POST` | Extraction Pronote directe synchrone (~15s) |
-| **Sondage de Job** | `https://pronote-api.hugdu77777.workers.dev/api/job/:jobId` | `GET` | Récupération du résultat si la requête a basculé en différé |
-| **Santé & Heartbeat** | `https://pronote-api.hugdu77777.workers.dev/api/health` | `GET` | État de la passerelle Cloudflare et du runner 5h |
-| **Documentation & Playground Web** | `https://jeanhug.github.io/Pronote-API/` | `GET` | Interface graphique avec testeur en direct et schéma JSON |
+Cette version corrige 103 problèmes identifiés dans l'audit (`AUDIT-PRONOTE-API.md`). Les décisions structurantes :
+
+| Avant | Après | Pourquoi |
+|---|---|---|
+| **Cloudflare KV** comme file d'attente et bus de résultats | **Durable Object SQLite** | KV est *eventually consistent* : jusqu'à **60 s** de propagation, alors que la boucle d'attente était plafonnée à 50 s. L'API ne pouvait structurellement pas répondre — d'où les ~2 minutes observées. Un Durable Object est mono-thread et fortement cohérent. |
+| **Deux implémentations** du scraping, c'est la mauvaise qui tournait | **Une seule**, conforme au schéma | `pronoteExtractor.ts` (808 lignes, produisant les vraies données) n'était **importé par personne**. Le parseur exécuté décrivait 57 champs documentés dont 4 seulement existaient. |
+| Documentation écrite à la main | **Générée depuis le schéma** | La doc annonçait « 10-12 s » et un mode différé inutilisable. Désormais `tests/schema.test.ts` échoue si un champ documenté disparaît. |
+| Aucun test | **69 tests** | `tsc` et le build passaient : aucun des 103 bugs n'était détectable automatiquement. |
+| Endpoints runner ouverts au public | **Authentifiés (fail-closed)** | `GET /api/runner/poll-job` distribuait les mots de passe ENT à quiconque appelait l'URL. |
+| Identifiants publiés en commentaire d'issue publique | **Plus jamais transmis hors du runner** | Chaque requête postait `{"username":…,"password":…}` sur l'issue #1, sur un dépôt public. |
+| CORS `*` sur tous les endpoints | **Origines restreintes** | Les `jobId` étant prédictibles et `/api/job/:jobId` non authentifié, n'importe quel site pouvait lire les notes des élèves. |
+| PAT GitHub en clair dans `worker.js` | **Secret Wrangler uniquement** | Le token était « obfusqué » par un `.join("_")` — reconstituable en une ligne, et dans l'historique git. |
+
+### Latences supprimées
+
+| Source | Gain |
+|---|---|
+| Propagation KV (job et résultat) | **0 à 120 s → quelques ms** |
+| `html` + `rawHtml` dupliqués dans la réponse JSON | plusieurs Mo par requête |
+| 4 × `setTimeout(900)` fixes | → attentes conditionnelles |
+| 8 s + 7 s d'attentes sur timeout | → échec rapide et explicite |
+| Parcours `$('*')` de tout le DOM pour les devoirs | → sélecteur ciblé |
+| Boot du runner (22 s mesurés) | atténué par le relais de session |
 
 ---
 
-## 🚀 Comment faire un appel à l'API ?
+## Démarrage
 
-### 1. Avec cURL
 ```bash
-curl -X POST "https://pronote-api.hugdu77777.workers.dev/api/scrape-pronote" \
+npm install
+npm run check          # typecheck strict + 69 tests
+npm run dev            # wrangler dev (Worker en local)
+npm run deploy         # wrangler deploy
+npm run build:docs     # génère docs/index.html depuis le schéma
+```
+
+### Secrets à configurer
+
+**Secrets du dépôt GitHub** (Settings → Secrets and variables → Actions) :
+
+| Secret | Rôle | Requis |
+|---|---|---|
+| `CLOUDFLARE_TOKEN` | Déploiement du Worker (permissions *Workers Scripts: Edit*) | oui |
+| `CLOUDFLARE_ID` | Account ID Cloudflare | oui |
+| `GH_TOKEN` | Permet au Worker de déclencher le runner | oui |
+| `RUNNER_TOKEN` | Secret partagé Worker ↔ runner (repli sur `GH_TOKEN`) | recommandé |
+| `ENT_ID` / `ENT_PASS` | Test live uniquement | pour `live-test` |
+
+**Secrets du Worker** (`wrangler secret put NOM`) — configurés automatiquement par le workflow `Deploy Worker`. Voir `.env.example`.
+
+---
+
+## API
+
+| Méthode | Chemin | Description |
+|---|---|---|
+| `POST` | `/api/v1/scrape-pronote` | Extraction complète |
+| `GET` | `/api/v1/job/:jobId` | Résultat d'un job (202 tant qu'il tourne) |
+| `GET` | `/api/v1/health` | État de la passerelle et du runner |
+| `GET` | `/api/v1/schema` | Schéma machine (champs, codes d'erreur) |
+| `GET` | `/docs` | Documentation générée |
+
+### Exemple
+
+```bash
+curl -X POST "https://pronote-api.hugdu77777.workers.dev/api/v1/scrape-pronote" \
   -H "Content-Type: application/json" \
   -d '{
-    "username": "mon.identifiant.ent",
-    "password": "MonMotDePasseSecret!",
+    "username": "prenom.nom",
+    "password": "VOTRE_MOT_DE_PASSE",
     "pronoteUrl": "https://0771068t.index-education.net/pronote/eleve.html",
-    "entUrl": "https://ent.seine-et-marne.fr/",
-    "format": "json"
+    "entUrl": "https://ent.seine-et-marne.fr/"
   }'
 ```
 
----
+### Réponse
 
-### 2. Avec JavaScript / TypeScript (Node.js & Navigateur)
-```javascript
-async function getPronoteData(username, password) {
-  const GATEWAY = "https://pronote-api.hugdu77777.workers.dev";
-
-  const res = await fetch(`${GATEWAY}/api/scrape-pronote`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      username,
-      password,
-      pronoteUrl: "https://0771068t.index-education.net/pronote/eleve.html",
-      entUrl: "https://ent.seine-et-marne.fr/",
-      format: "json"
-    })
-  });
-
-  const json = await res.json();
-
-  // Mode Synchrone (Résultat reçu en direct en ~15s)
-  if (res.status === 200 && json.success) {
-    console.log("Élève :", json.data.eleve.nom, json.data.eleve.classe);
-    console.log("Emploi du temps :", json.data.emploiDuTemps.tousLesCours.length, "cours");
-    console.log("Moyenne Générale :", json.data.notes.moyenneGenerale, "/ 20");
-    return json.data;
-  }
-
-  // Mode Asynchrone (202 Accepted) -> Polling toutes les 1.5s
-  if (res.status === 202 && json.jobId) {
-    console.log(`Traitement en cours... Suivi du job ${json.jobId}`);
-    while (true) {
-      await new Promise(r => setTimeout(r, 1500));
-      const pollRes = await fetch(`${GATEWAY}/api/job/${json.jobId}`);
-      const pollData = await pollRes.json();
-      if (pollData.success && pollData.data) {
-        return pollData.data;
-      }
-      if (pollData.error) throw new Error(pollData.error);
-    }
-  }
-
-  throw new Error(json.error || "Erreur de scraping");
-}
-```
-
----
-
-### 3. Avec Python 3 (`requests`)
-```python
-import requests
-import time
-
-GATEWAY = "https://pronote-api.hugdu77777.workers.dev"
-
-def fetch_pronote(username, password):
-    payload = {
-        "username": username,
-        "password": password,
-        "pronoteUrl": "https://0771068t.index-education.net/pronote/eleve.html",
-        "entUrl": "https://ent.seine-et-marne.fr/",
-        "format": "json"
-    }
-
-    res = requests.post(f"{GATEWAY}/api/scrape-pronote", json=payload)
-
-    if res.status_code == 200:
-        return res.json()["data"]
-
-    elif res.status_code == 202:
-        job_id = res.json().get("jobId")
-        print(f"Polling job {job_id}...")
-        for _ in range(40):
-            time.sleep(1.5)
-            poll = requests.get(f"{GATEWAY}/api/job/{job_id}").json()
-            if poll.get("success") and "data" in poll:
-                return poll["data"]
-
-    raise Exception(f"Erreur ({res.status_code}): {res.text}")
-```
-
----
-
-## 📋 Exemple Réel du JSON Renvoyé (100% Validé)
-
-```json
+```jsonc
 {
-  "jobId": "job_1789294245192_w7x9a",
+  "jobId": "3f8a2c10-9b4e-4a7d-8c1f-2e5b9d0a7c34",
   "success": true,
-  "executionTimeMs": 15420,
-  "timestamp": "2026-09-13T10:10:48.000Z",
-  "data": {
-    "eleve": {
-      "nom": "FLAVIGNARD Emilien",
-      "classe": "3EME6",
-      "etablissement": "COLLEGE ROSA BONHEUR",
-      "photoUrl": "https://0771068t.index-education.net/pronote/DocEleve/photo.jpg",
-      "periodeActuelle": "1er Trimestre"
-    },
-    "emploiDuTemps": {
-      "tousLesCours": [
-        {
-          "jour": "Lundi",
-          "date": "07/09/2026",
-          "heureDebut": "09h25",
-          "heureFin": "10h20",
-          "matiere": "ALLEMAND LV2",
-          "professeur": "MOREAU F.",
-          "salle": "203",
-          "groupe": "3EMES-1-2-ALL2",
-          "statut": "Normal"
-        },
-        {
-          "jour": "Mardi",
-          "date": "08/09/2026",
-          "heureDebut": "08h30",
-          "heureFin": "09h25",
-          "matiere": "MATHEMATIQUES",
-          "professeur": "LECLERC M.",
-          "salle": "204",
-          "groupe": "Classe entière",
-          "statut": "Normal"
-        }
-      ]
-    },
-    "notes": {
-      "moyenneGenerale": "20.00",
-      "moyenneGeneraleClasse": "15.24",
-      "evaluations": [
-        {
-          "date": "10 sept",
-          "matiere": "FRANCAIS",
-          "titre": "Évaluation FRANCAIS - Lecture & Compréhension",
-          "note": "10.00",
-          "sur": "10",
-          "coefficient": 1,
-          "moyenneClasse": "7.62",
-          "noteMin": null,
-          "noteMax": null
-        },
-        {
-          "date": "11 sept",
-          "matiere": "MATHEMATIQUES",
-          "titre": "Contrôle N°1 - Calcul littéral",
-          "note": "20.00",
-          "sur": "20",
-          "coefficient": 2,
-          "moyenneClasse": "14.50",
-          "noteMin": "06.00",
-          "noteMax": "20.00"
-        }
-      ]
-    },
-    "devoirs": [
-      {
-        "pourLe": "15/09/2026",
-        "matiere": "FRANCAIS",
-        "titre": "Lecture chapitre 3",
-        "description": "Lire attentivement le chapitre 3 et répondre aux questions 1 à 4 page 56.",
-        "fait": false,
-        "avecRendu": false
-      }
+  "status": "done",
+  "executionTimeMs": 11340,
+  "timestamp": "2026-09-14T16:02:11.482Z",
+  "extraction": {
+    "hasData": true,
+    "modules": [
+      { "module": "emploiDuTemps", "status": "ok", "itemCount": 26 },
+      { "module": "menuCantine",   "status": "empty", "itemCount": 0 }
     ],
-    "ressources": [
-      {
-        "matiere": "HISTOIRE-GEOGRAPHIE",
-        "titre": "Carte de l'Europe en 1914",
-        "description": "Document de cours projeté lors de la séance du 10 septembre.",
-        "url": "https://0771068t.index-education.net/pronote/fichiers/carte_1914.pdf",
-        "type": "document"
-      }
-    ]
+    "missingModules": ["menuCantine"],
+    "timingsMs": { "ent": 1180, "authentification": 2100, "emploiDuTemps": 340, "total": 11340 },
+    "engineVersion": "4.0.0"
+  },
+  "data": {
+    "eleve":          { "nom": "DUPONT", "prenom": "Lucas", "classe": "3EME6", "…": "…" },
+    "emploiDuTemps":  { "anneeScolaire": "2026-2027", "totalCours": 26, "semaines": ["…"] },
+    "notes":          { "moyenneGenerale": 15.82, "moyennesParMatiere": ["…"], "…": "…" },
+    "agenda":         { "totalDevoirs": 9, "totalDevoirsAFaire": 5, "devoirs": ["…"] },
+    "contenusEtRessources": { "totalRessources": 34, "parMatiere": ["…"] },
+    "vieScolaire":    { "totalAbsences": 2, "…": "…" },
+    "evaluationsEtCompetences": { "…": "…" },
+    "messagerieEtActualites":   { "…": "…" },
+    "menuCantine":    { "semaine": ["…"] },
+    "meta":           { "scrapedAt": "…", "depuisCache": false }
   }
 }
 ```
 
+Le détail complet des champs est sur `/docs` ou `/api/v1/schema`.
+
+### Quand l'extraction dépasse le budget d'attente
+
+L'API répond **`202 Accepted`** avec un `jobId` **exploitable** :
+
+```jsonc
+{
+  "jobId": "3f8a2c10-…",
+  "success": false,
+  "status": "running",
+  "errorCode": "TIMEOUT",
+  "statusUrl": "https://…/api/v1/job/3f8a2c10-…",
+  "retryAfterSeconds": 3
+}
+```
+
+Il suffit d'interroger `statusUrl` jusqu'à obtenir un `200` (ou `502` en cas d'échec réel). L'ancienne version renvoyait un `504` **sans aucun identifiant**, rendant le mode différé documenté totalement inutilisable.
+
+### Codes d'erreur
+
+`INVALID_REQUEST`, `INVALID_CREDENTIALS`, `ENT_AUTH_FAILED`, `PRONOTE_AUTH_FAILED`, `ENT_UNREACHABLE`, `PRONOTE_UNREACHABLE`, `NAVIGATION_TIMEOUT`, `EXTRACTION_EMPTY`, `EXTRACTION_PARTIAL`, `RATE_LIMITED`, `UNAUTHORIZED`, `FORBIDDEN_HOST`, `NO_RUNNER_AVAILABLE`, `TIMEOUT`, `INTERNAL_ERROR`.
+
+`EXTRACTION_EMPTY` remplace l'ancien comportement qui renvoyait `success: true` avec des données vides — impossible pour un client de distinguer « cet élève n'a aucune note » de « l'extraction a échoué ».
+
 ---
 
-## 📖 Dictionnaire des Paramètres & Formats
+## Tests
 
-| Paramètre | Type | Requis | Description |
-| :--- | :--- | :--- | :--- |
-| `username` | String | Oui | Identifiant de connexion ENT |
-| `password` | String | Oui | Mot de passe de connexion ENT |
-| `pronoteUrl` | String | Optionnel | URL directe de l'espace élève Pronote |
-| `entUrl` | String | Optionnel | URL du portail ENT |
-| `format` | String | Optionnel | `"json"` (défaut), `"html"` (interface stylisée avec CSS Pronote) ou `"raw_html"` |
-| `forceAsync` | Boolean | Optionnel | Si `true`, force la réponse 202 immédiate avec `jobId` |
+```bash
+npm test                          # 69 tests
+npm run typecheck                 # tsc --noEmit, strict
+npx tsx --test tests/parse.test.ts  # un fichier en particulier
+```
+
+Les tests s'exécutent **hors ligne**, sur des fixtures HTML anonymisées. C'est possible parce que le parseur `src/pronote/parse.ts` est une **fonction pure** : HTML en entrée, `PronoteData` en sortie, sans navigateur ni réseau.
+
+| Fichier | Ce qu'il vérifie |
+|---|---|
+| `tests/dates.test.ts` | Inférence d'année scolaire, semaine ISO, parsing des heures |
+| `tests/parse.test.ts` | Extraction complète sur fixtures, et **non-régression** des bugs corrigés |
+| `tests/schema.test.ts` | Chaque champ documenté existe réellement dans la sortie |
+| `tests/security.test.ts` | SSRF, assainissement des sessions, comparaison à temps constant |
+
+Le test le plus important est dans `schema.test.ts` : il résout chaque chemin documenté dans une réponse réelle. C'est ce qui rend impossible la dérive doc ↔ implémentation qui avait produit 53 champs fantômes.
 
 ---
 
-## ⚙️ Architecture Nouvelle Génération (~15s)
+## Confidentialité
 
-1. **Passerelle Edge Cloudflare Worker** : Reçoit la requête en HTTPS mondialement et surveille les résultats en double canal.
-2. **Runner GitHub Actions (16 Go RAM / 4 cœurs)** : Polling sub-seconde (800ms) pour intercepter le travail instantanément.
-3. **Extraction Simultanée en 5 Onglets** : Une fois la session SSO validée, Chromium scrape simultanément l'accueil, l'emploi du temps, les notes, les devoirs et les contenus de cours.
-4. **Relais Double Canal KV + GitHub Issues** : Les données sont publiées en parallèle sur Cloudflare KV et via l'API GitHub Issues, garantissant une transmission instantanée sans latence de réplication.
+Cette API manipule des données personnelles de mineurs. Trois garde-fous :
+
+- **Les identifiants ENT ne sortent jamais du runner.** Ils ne sont ni journalisés, ni publiés, ni stockés au-delà de la durée de vie du job (30 min en file, 1 h pour les résultats).
+- **Le rapport de test live est assaini sur dépôt public.** Les logs et artefacts d'un dépôt public sont lisibles par tout le monde : `scripts/live-test.ts` n'écrit la réponse intégrale que si le dépôt est privé.
+- **Aucune donnée d'élève n'est publiée sur GitHub.** Les diagnostics éventuellement postés en commentaire d'issue sont limités à `{ jobId, statut, code d'erreur, durée }`.
 
 ---
 
-## 📄 Licence & Mentions Légales
-Ce projet est développé à des fins d'interopérabilité et d'automatisation personnelle. Pronote et Index Éducation sont des marques déposées de Docaposte / La Poste.
+## Structure
+
+```
+src/pronote/            Moteur d'extraction — sans navigateur, testable hors ligne
+  types.ts              Contrat de données (source de vérité)
+  schema.ts             Schéma exécutable + exemples (génère la doc)
+  parse.ts              Parseur : HTML → PronoteData (fonctions pures)
+  dates.ts              Inférence d'années scolaires, semaines ISO
+  report.ts             Rapport de complétude des modules
+
+worker/                 Passerelle Cloudflare
+  index.ts              Routage, authentification, validation
+  jobstore.ts           Durable Object : file d'attente et résultats
+  security.ts           SSRF, CORS, assainissement, comparaison constante
+  github.ts             Déclenchement du runner via l'API GitHub
+  docs.ts               Génération de la documentation
+
+pronote-standalone-runner/
+  runner.ts             Boucle de session (~5 h)
+  scraper.ts            Puppeteer : ENT → Pronote → captures DOM
+
+tests/                  69 tests + fixtures HTML anonymisées
+scripts/                Test live, génération de la doc
+```
+
+---
+
+## Limites
+
+- **10 extractions/minute/IP.** File d'attente de 30 minutes, résultats conservés 1 heure.
+- **Le scraping est intrinsèquement lent** (~10-15 s) : il ouvre un navigateur et authentifie un SSO. La latence perçue dépend surtout de la disponibilité du runner.
+- **Un seul établissement par défaut.** `pronoteUrl` et `entUrl` sont paramétrables, mais la connexion ENT est écrite pour Seine-et-Marne (Alpine.js, `input[name=email]`). Un autre ENT demande un adaptateur.
+- **Pas de cache.** Un cache par `hash(username + pronoteUrl)` avec un TTL de 10 minutes réduirait fortement le coût, mais exposerait des données scolaires en mémoire partagée — décision à prendre explicitement.
+
+## Licence
+
+Aucune licence déclarée. Ce code interagit avec un service tiers (Pronote / Index Éducation) ; vérifiez les conditions d'utilisation applicables avant tout usage autre que personnel.
