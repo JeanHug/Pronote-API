@@ -419,16 +419,23 @@ async function captureTabs(
       }
 
       // Attente conditionnelle du contenu, plutôt qu'un setTimeout fixe.
-      await page.waitForSelector(tab.readySelector, { timeout: 6_000 }).catch(() => null);
+      const ready = await page.waitForSelector(tab.readySelector, { timeout: 6_000 })
+        .then(() => true).catch(() => false);
+      timings[`${tab.key}ContenuPret`] = ready ? 1 : 0;
       await new Promise((r) => setTimeout(r, 300)); // stabilisation AngularJS
 
       const html = await snapshot(page);
       (pages as Record<string, string>)[tab.key] = html;
-      timings[`${tab.key}Octets`] = Buffer.byteLength(html, 'utf8');
+      // `String.length` suffit au diagnostic et ne dépend d'aucun global Node.
+      timings[`${tab.key}Caracteres`] = html.length;
       timings[tab.key] = Date.now() - t;
     } catch (err) {
-      log(`Capture « ${tab.key} » en erreur : ${(err as Error).message}`);
+      const message = (err as Error).message || '';
+      log(`Capture « ${tab.key} » en erreur (${(err as Error).name || 'Error'}).`);
       (pages as Record<string, string>)[tab.key] = '';
+      timings[`${tab.key}Erreur`] = 1;
+      timings[`${tab.key}ErreurBuffer`] = /Buffer/i.test(message) ? 1 : 0;
+      timings[`${tab.key}ErreurCibleFermee`] = /Target|closed|Session/i.test(message) ? 1 : 0;
       timings[tab.key] = Date.now() - t;
     } finally {
       await page.close().catch(() => null);
