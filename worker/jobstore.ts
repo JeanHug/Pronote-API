@@ -42,13 +42,59 @@ const JOB_TTL_MS = 30 * 60 * 1000;       // 30 min : un job non traité est pér
 const RESULT_TTL_MS = 60 * 60 * 1000;    // 1 h de rétention des résultats
 const CLAIM_TIMEOUT_MS = 3 * 60 * 1000;  // un job « running » non terminé est remis en file
 const HEARTBEAT_TTL_MS = 60 * 1000;
-const RATE_WINDOW_MS = 60 * 1000;
-const MAX_JOBS_PER_WINDOW = 10;
+export const RATE_WINDOW_MS = 60 * 1000;
+export const MAX_JOBS_PER_WINDOW = 10;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+const MAX_WAIT_MS = 30_000;
+
+type JobState = {
+  status: string;
+  result: string | null;
+  errorCode: string | null;
+};
+
+type Waiter = (state: JobState) => void;
+type ClaimWaiter = { wake: () => void };
+
+export interface RateLimitRow {
+  n: number;
+  ts: number;
+}
+
+export interface RateLimitDecision extends RateLimitRow {
+  allowed: boolean;
+  remaining: number;
+  resetAt: number;
+}
+
+/**
+ * Calcule une fenêtre FIXE de limitation de débit.
+ *
+ * `ts` est l'instant du PREMIER appel de la fenêtre et ne bouge plus jusqu'à
+ * son expiration. L'ancienne implémentation le remplaçait par `now` à chaque
+ * appel, y compris refusé : un client qui suivait Retry-After repoussait donc
+ * sa propre échéance indéfiniment.
+ */
+export function advanceRateLimit(current: RateLimitRow | undefined, now: number): RateLimitDecision {
+  const active = Boolean(current && now - current.ts < RATE_WINDOW_MS);
+  const ts = active && current ? current.ts : now;
+  const n = active && current ? current.n + 1 : 1;
+  return {
+    n,
+    ts,
+    allowed: n <= MAX_JOBS_PER_WINDOW,
+    remaining: Math.max(0, MAX_JOBS_PER_WINDOW - n),
+    resetAt: ts + RATE_WINDOW_MS,
+  };
+}
 
 export class JobStore implements DurableObject {
   private state: DurableObjectState;
   private sql: SqlStorage;
+  /** Requêtes /wait actuellement suspendues, réveillées dès POST /result. */
+  private waiters = new Map<string, Set<Waiter>>();
+  /** Long-polls des runners au repos, réveillés dès la création d'un job. */
+  private claimWaiters: ClaimWaiter[] = [];
 
   constructor(state: DurableObjectState) {
     this.state = state;
@@ -122,11 +168,18 @@ export class JobStore implements DurableObject {
     const path = url.pathname;
 
     try {
+      // Compteur persistant du coût réel d'une extraction. Les lectures de
+      // santé servant à lire le compteur sont volontairement exclues : une
+      // mesure avant/après rapporte ainsi exactement les requêtes du flux
+      // mesuré, sans ajouter le coût de la sonde elle-même.
+      if (path !== '/health') this.countRequest();
+
       switch (`${request.method} ${path}`) {
         case 'POST /job':            return await this.createJob(request);
         case 'POST /claim':          return await this.claimJob(request);
         case 'POST /result':         return await this.storeResult(request);
         case 'GET /result':          return await this.getResult(url);
+        case 'POST /wait':           return await this.waitForResult(request);
         case 'POST /heartbeat':      return await this.heartbeat(request);
         case 'GET /health':          return await this.health();
         case 'POST /ratelimit':      return await this.rateLimit(request);
@@ -137,6 +190,18 @@ export class JobStore implements DurableObject {
     } catch (err) {
       return this.json({ error: (err as Error).message }, 500);
     }
+  }
+
+  private countRequest(): void {
+    this.sql.exec(`
+      INSERT INTO meta (k, v) VALUES ('do_requests', '1')
+      ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT)
+    `);
+  }
+
+  private requestCount(): number {
+    const row = [...this.sql.exec<{ v: string }>(`SELECT v FROM meta WHERE k = 'do_requests'`)][0];
+    return Number(row?.v ?? 0);
   }
 
   // -------------------------------------------------------------------------
@@ -157,6 +222,10 @@ export class JobStore implements DurableObject {
       body.pronoteUrl, body.entUrl, body.format, Date.now(),
     );
 
+    // Réveille immédiatement un runner en long-poll. Sans cela, sa boucle à
+    // 300 ms consommerait à elle seule plus de 100 000 requêtes par jour.
+    this.claimWaiters.shift()?.wake();
+
     return this.json({ ok: true, jobId: body.jobId }, 201);
   }
 
@@ -165,32 +234,22 @@ export class JobStore implements DurableObject {
    * Le DO étant mono-thread, deux runners ne peuvent JAMAIS obtenir le même
    * job — ce que KV permettait (double scraping, double coût).
    */
-  private async claimJob(request: Request): Promise<Response> {
-    const { runnerId } = await request.json<{ runnerId: string }>();
-
-    const rows = [...this.sql.exec<JobRecord>(
+  private takeJob(runnerId: string): JobRecord | null {
+    const job = [...this.sql.exec<JobRecord>(
       `SELECT * FROM jobs WHERE status = 'queued' ORDER BY createdAt ASC LIMIT 1`,
-    )];
+    )][0];
+    if (!job) return null;
 
-    if (rows.length === 0) {
-      return this.json({ hasJob: false }, 200);
-    }
-
-    const job = rows[0];
     this.sql.exec(
       `UPDATE jobs SET status = 'running', claimedAt = ?, runnerId = ?, attempts = attempts + 1
         WHERE jobId = ? AND status = 'queued'`,
       Date.now(), runnerId, job.jobId,
     );
+    return job;
+  }
 
-    // Vérification : si l'UPDATE n'a rien touché, un autre a pris le job.
-    const check = [...this.sql.exec<{ status: string }>(
-      `SELECT status FROM jobs WHERE jobId = ?`, job.jobId,
-    )];
-    if (check[0]?.status !== 'running') {
-      return this.json({ hasJob: false }, 200);
-    }
-
+  private claimResponse(job: JobRecord | null): Response {
+    if (!job) return this.json({ hasJob: false }, 200);
     return this.json({
       hasJob: true,
       job: {
@@ -204,6 +263,31 @@ export class JobStore implements DurableObject {
     }, 200);
   }
 
+  private async claimJob(request: Request): Promise<Response> {
+    const { runnerId, waitMs = 0 } = await request.json<{ runnerId: string; waitMs?: number }>();
+    const immediate = this.takeJob(runnerId);
+    if (immediate || waitMs <= 0) return this.claimResponse(immediate);
+
+    const timeoutMs = Math.max(1, Math.min(Number.isFinite(waitMs) ? waitMs : 0, MAX_WAIT_MS));
+    return await new Promise<Response>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout>;
+      const waiter: ClaimWaiter = {
+        wake: () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          this.claimWaiters = this.claimWaiters.filter((w) => w !== waiter);
+          resolve(this.claimResponse(this.takeJob(runnerId)));
+        },
+      };
+
+      this.claimWaiters.push(waiter);
+      timer = setTimeout(waiter.wake, timeoutMs);
+      request.signal.addEventListener('abort', waiter.wake, { once: true });
+    });
+  }
+
   // -------------------------------------------------------------------------
   // Résultats
   // -------------------------------------------------------------------------
@@ -213,21 +297,42 @@ export class JobStore implements DurableObject {
       jobId: string; success: boolean; payload: string; errorCode?: string;
     }>();
 
-    const status = body.success ? 'done' : 'error';
-
-    // On ne stocke QUE la réponse assainie de l'API — plus jamais le HTML
-    // complet de la session, qui doublait le volume transféré et stocké.
-    this.sql.exec(
-      `UPDATE jobs SET status = ?, result = ?, errorCode = ? WHERE jobId = ?`,
-      status, body.payload, body.errorCode ?? null, body.jobId,
-    );
-
     const check = [...this.sql.exec<{ jobId: string }>(`SELECT jobId FROM jobs WHERE jobId = ?`, body.jobId)];
     if (check.length === 0) {
       return this.json({ ok: false, error: 'jobId inconnu' }, 404);
     }
 
+    const status = body.success ? 'done' : 'error';
+    const state: JobState = {
+      status,
+      result: body.payload,
+      errorCode: body.errorCode ?? null,
+    };
+
+    // On ne stocke QUE la réponse assainie de l'API — plus jamais le HTML
+    // complet de la session, qui doublait le volume transféré et stocké.
+    this.sql.exec(
+      `UPDATE jobs SET status = ?, result = ?, errorCode = ? WHERE jobId = ?`,
+      state.status, state.result, state.errorCode, body.jobId,
+    );
+
+    // Réveil immédiat de toutes les requêtes synchrones tenues ouvertes pour
+    // ce job. Une seule requête DO remplace les ~125 GET générés auparavant
+    // par la scrutation toutes les 200 ms.
+    const listeners = this.waiters.get(body.jobId);
+    if (listeners) {
+      this.waiters.delete(body.jobId);
+      for (const notify of listeners) notify(state);
+    }
+
     return this.json({ ok: true }, 200);
+  }
+
+  private readJobState(jobId: string): JobState {
+    const row = [...this.sql.exec<JobState>(
+      `SELECT status, result, errorCode FROM jobs WHERE jobId = ?`, jobId,
+    )][0];
+    return row ?? { status: 'expired', result: null, errorCode: null };
   }
 
   private async getResult(url: URL): Promise<Response> {
@@ -236,20 +341,56 @@ export class JobStore implements DurableObject {
       return this.json({ error: 'jobId invalide' }, 400);
     }
 
-    const rows = [...this.sql.exec<{ status: string; result: string | null; errorCode: string | null; createdAt: number }>(
-      `SELECT status, result, errorCode, createdAt FROM jobs WHERE jobId = ?`, jobId,
-    )];
+    const state = this.readJobState(jobId);
+    if (state.status === 'done' || state.status === 'error') {
+      return this.json(state, 200);
+    }
+    return this.json({ status: state.status }, 200);
+  }
 
-    if (rows.length === 0) {
-      return this.json({ status: 'expired' }, 200);
+  /**
+   * Attend le résultat sans scrutation.
+   *
+   * La requête reste suspendue dans l'instance du Durable Object. `storeResult`
+   * résout sa promesse dès l'écriture SQLite ; le timeout ne sert qu'à rendre
+   * la main au Worker afin qu'il émette son 202 exploitable.
+   */
+  private async waitForResult(request: Request): Promise<Response> {
+    const body = await request.json<{ jobId?: string; timeoutMs?: number }>();
+    const jobId = body.jobId ?? '';
+    if (!/^[A-Za-z0-9_-]{8,100}$/.test(jobId)) {
+      return this.json({ error: 'jobId invalide' }, 400);
     }
 
-    const r = rows[0];
-    if (r.status === 'done' || r.status === 'error') {
-      return this.json({ status: r.status, result: r.result, errorCode: r.errorCode }, 200);
+    const immediate = this.readJobState(jobId);
+    if (immediate.status === 'done' || immediate.status === 'error' || immediate.status === 'expired') {
+      return this.json(immediate, 200);
     }
 
-    return this.json({ status: r.status }, 200);
+    const requested = Number(body.timeoutMs ?? MAX_WAIT_MS);
+    const timeoutMs = Math.max(1, Math.min(Number.isFinite(requested) ? requested : MAX_WAIT_MS, MAX_WAIT_MS));
+
+    return await new Promise<Response>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout>;
+
+      const finish = (state: JobState): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const listeners = this.waiters.get(jobId);
+        listeners?.delete(finish);
+        if (listeners?.size === 0) this.waiters.delete(jobId);
+        resolve(this.json(state, 200));
+      };
+
+      const listeners = this.waiters.get(jobId) ?? new Set<Waiter>();
+      listeners.add(finish);
+      this.waiters.set(jobId, listeners);
+
+      timer = setTimeout(() => finish(this.readJobState(jobId)), timeoutMs);
+      request.signal.addEventListener('abort', () => finish(this.readJobState(jobId)), { once: true });
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -276,6 +417,7 @@ export class JobStore implements DurableObject {
       runnerId: hb?.runnerId ?? null,
       lastPing: hb?.lastPing ?? null,
       queueDepth: pending,
+      requetesDO: this.requestCount(),
     }, 200);
   }
 
@@ -288,34 +430,27 @@ export class JobStore implements DurableObject {
     const now = Date.now();
     const bucket = key || 'anon';
 
-    const rows = [...this.sql.exec<{ n: number; ts: number }>(
+    const current = [...this.sql.exec<{ n: number; ts: number }>(
       `SELECT n, ts FROM hits WHERE bucket = ?`, bucket,
-    )];
+    )][0];
+    const decision = advanceRateLimit(current, now);
 
-    let n = 0;
-    if (rows.length > 0 && now - rows[0].ts < RATE_WINDOW_MS) {
-      n = rows[0].n;
-    }
-
-    n += 1;
+    // `ts` reste le début de la fenêtre active. Les refus ne repoussent donc
+    // jamais l'échéance annoncée au client par Retry-After.
     this.sql.exec(
       `INSERT INTO hits (bucket, n, ts) VALUES (?, ?, ?)
        ON CONFLICT(bucket) DO UPDATE SET n = ?, ts = ?`,
-      bucket, n, now, n, now,
+      bucket, decision.n, decision.ts, decision.n, decision.ts,
     );
 
-    return this.json({
-      allowed: n <= MAX_JOBS_PER_WINDOW,
-      remaining: Math.max(0, MAX_JOBS_PER_WINDOW - n),
-      resetAt: now + RATE_WINDOW_MS,
-    }, 200);
+    return this.json(decision, 200);
   }
 
   private async stats(): Promise<Response> {
     const byStatus = [...this.sql.exec<{ status: string; n: number }>(
       `SELECT status, COUNT(*) AS n FROM jobs GROUP BY status`,
     )];
-    return this.json({ byStatus }, 200);
+    return this.json({ byStatus, requetesDO: this.requestCount() }, 200);
   }
 
   private json(body: unknown, status: number): Response {

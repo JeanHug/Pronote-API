@@ -1,0 +1,52 @@
+name: CI v4
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Installation reproductible
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "true"
+        run: npm ci
+
+      - name: TypeScript strict
+        run: npm run typecheck
+
+      - name: Tests hors ligne
+        run: npm test
+
+      - name: Vérification du bundle Worker
+        run: npx wrangler deploy --dry-run
+
+      - name: Cloudflare KV est banni
+        run: |
+          if grep -RInE 'PRONOTE_KV|kv_namespaces|\[\[kv_namespaces\]\]' \
+            --exclude='AUDIT-PRONOTE-API.md' \
+            --exclude='package-lock.json' \
+            --exclude='*.test.ts' \
+            worker wrangler.toml pronote-standalone-runner scripts; then
+            echo '::error::Une dépendance résiduelle à Cloudflare KV a été détectée.'
+            exit 1
+          fi

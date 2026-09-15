@@ -2,11 +2,13 @@ name: Deploy Documentation to GitHub Pages
 
 on:
   push:
-    paths-ignore:
-      - 'pronote-standalone-runner/**'
-      - '.github/workflows/pronote-runner.yml'
-    branches:
-      - main
+    branches: [main]
+    paths:
+      - "src/pronote/schema.ts"
+      - "worker/docs.ts"
+      - "scripts/build-docs.ts"
+      - "README.md"
+      - ".github/workflows/deploy-pages.yml"
   workflow_dispatch:
 
 permissions:
@@ -16,7 +18,7 @@ permissions:
 
 concurrency:
   group: github-pages-doc
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build-and-deploy:
@@ -24,34 +26,33 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v5
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Node.js 22
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
+          cache: npm
 
-      - name: Install Dependencies
-        run: npm install
+      - name: Installation reproductible sans Chromium
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "true"
+        run: npm ci
 
-      - name: Build Vite SPA
-        run: npx vite build --base=./
+      - name: Générer la documentation depuis le schéma
+        run: npm run build:docs
 
-      - name: Copy Documentation Assets
-        run: |
-          cp docs/index.html dist/standalone.html || true
-          cp docs/index.html dist/docs.html || true
+      - name: Configurer GitHub Pages
+        uses: actions/configure-pages@v5
 
-      - name: Setup Pages
-        uses: actions/configure-pages@v4
-
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+      - name: Téléverser la documentation statique
+        uses: actions/upload-pages-artifact@v4
         with:
-          path: './dist'
+          path: docs
 
-      - name: Deploy to GitHub Pages
+      - name: Déployer
         id: deployment
         uses: actions/deploy-pages@v4

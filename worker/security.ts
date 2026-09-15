@@ -161,16 +161,6 @@ export function cleanText(s: unknown, maxLen = 2000): string {
     .slice(0, maxLen);
 }
 
-/**
- * Masque un identifiant pour les logs : garde les 2 premiers caractères.
- * Utilisé pour tracer un job sans jamais écrire d'identifiant en clair.
- */
-export function maskLogin(login: string): string {
-  if (!login) return '(vide)';
-  if (login.length <= 2) return '**';
-  return login.slice(0, 2) + '*'.repeat(Math.min(login.length - 2, 12));
-}
-
 // ---------------------------------------------------------------------------
 // En-têtes de réponse
 // ---------------------------------------------------------------------------

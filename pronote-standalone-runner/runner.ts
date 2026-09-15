@@ -89,7 +89,9 @@ interface JobMessage {
 
 async function workerFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 20_000);
+  // /next-job utilise un long-poll de 25 s : le timeout réseau doit lui
+  // laisser une marge, sans rendre les autres appels non bornés.
+  const timer = setTimeout(() => ctrl.abort(), 35_000);
   try {
     return await fetch(`${WORKER_URL}${path}`, {
       ...init,
@@ -302,7 +304,9 @@ async function mainLoop(): Promise<void> {
 
       const res = await workerFetch('/api/v1/runner/next-job', {
         method: 'POST',
-        body: JSON.stringify({ runnerId: RUNNER_ID }),
+        // Le Durable Object tient cette requête ouverte et la réveille dès
+        // qu'un job arrive. Cela remplace ~3,3 requêtes/s au repos.
+        body: JSON.stringify({ runnerId: RUNNER_ID, waitMs: 25_000 }),
       });
 
       if (!res.ok) {
