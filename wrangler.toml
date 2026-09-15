@@ -60,11 +60,7 @@ GITHUB_REPO = "Pronote-API"
 [observability]
 enabled = true
 
-# --- Limites ---------------------------------------------------------------
-# On reste sous les quotas du plan Workers Free, et on s'assure qu'aucun
-# emballement ne peut faire exploser la facture ou les quotas :
-#   - le Worker ne fait qu'UNE sous-requête externe (dispatch GitHub), le
-#     reste passe par le Durable Object (quota interne, plus élevé)
-#   - 30 s de CPU maximum par invocation, très au-dessus des besoins réels
-[limits]
-cpu_ms = 30000
+# Aucun bloc `[limits]` : Cloudflare refuse les limites CPU personnalisées sur
+# l'offre Workers Free (erreur API 100328). Le garde-fou de coût applicable est
+# le quota de 100 000 requêtes/jour, mesuré via `requetesDO` et verrouillé par
+# tests/budget.test.ts.
