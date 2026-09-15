@@ -411,6 +411,8 @@ async function captureTabs(
       const res = await page.evaluate(
         `${NAVIGATE_FN}(${JSON.stringify(tab.parents)}, ${JSON.stringify(tab.sub)})`,
       ).catch(() => null) as { parent: boolean; sub: boolean } | null;
+      timings[`${tab.key}ParentTrouve`] = res?.parent ? 1 : 0;
+      timings[`${tab.key}SousOngletTrouve`] = res?.sub ? 1 : 0;
 
       if (!res?.sub) {
         log(`Onglet « ${tab.sub} » non trouvé (parent: ${res?.parent ?? false}).`);
@@ -420,7 +422,9 @@ async function captureTabs(
       await page.waitForSelector(tab.readySelector, { timeout: 6_000 }).catch(() => null);
       await new Promise((r) => setTimeout(r, 300)); // stabilisation AngularJS
 
-      (pages as Record<string, string>)[tab.key] = await snapshot(page);
+      const html = await snapshot(page);
+      (pages as Record<string, string>)[tab.key] = html;
+      timings[`${tab.key}Octets`] = Buffer.byteLength(html, 'utf8');
       timings[tab.key] = Date.now() - t;
     } catch (err) {
       log(`Capture « ${tab.key} » en erreur : ${(err as Error).message}`);

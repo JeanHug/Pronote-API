@@ -398,10 +398,13 @@ export class JobStore implements DurableObject {
   // -------------------------------------------------------------------------
 
   private async heartbeat(request: Request): Promise<Response> {
-    const body = await request.json<{ runnerId: string; status?: string; logs?: string[] }>();
+    const body = await request.json<{
+      runnerId: string; status?: string; logs?: string[]; protocolVersion?: number;
+    }>();
     await this.state.storage.put('heartbeat', {
       runnerId: body.runnerId,
       status: body.status || 'running',
+      protocolVersion: body.protocolVersion ?? 0,
       lastPing: Date.now(),
       logs: (body.logs || []).slice(-20),
     });
@@ -409,8 +412,12 @@ export class JobStore implements DurableObject {
   }
 
   private async health(): Promise<Response> {
-    const hb = await this.state.storage.get<{ lastPing: number; runnerId: string }>('heartbeat');
-    const online = Boolean(hb && Date.now() - hb.lastPing < HEARTBEAT_TTL_MS);
+    const hb = await this.state.storage.get<{
+      lastPing: number; runnerId: string; protocolVersion?: number;
+    }>('heartbeat');
+    const online = Boolean(
+      hb && hb.protocolVersion === 4 && Date.now() - hb.lastPing < HEARTBEAT_TTL_MS,
+    );
     const pending = [...this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM jobs WHERE status = 'queued'`)][0]?.n ?? 0;
     return this.json({
       runnerOnline: online,

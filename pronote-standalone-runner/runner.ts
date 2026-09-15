@@ -99,6 +99,7 @@ async function workerFetch(path: string, init: RequestInit = {}): Promise<Respon
       headers: {
         'Authorization': `Bearer ${RUNNER_TOKEN}`,
         'Content-Type': 'application/json',
+        'X-Runner-Protocol': '4',
         'User-Agent': `Pronote-Runner/${RUNNER_ID}`,
         ...(init.headers ?? {}),
       },
@@ -206,6 +207,9 @@ async function handleJob(job: JobMessage): Promise<void> {
           timestamp: new Date().toISOString(),
           errorCode: outcome.errorCode ?? ('SCRAPER_ERROR' as ErrorCode),
           error: outcome.error ?? 'Erreur inconnue.',
+          // Uniquement durées, compteurs d'octets et booléens 0/1 : aucune
+          // donnée DOM ni aucun identifiant. Utile pour diagnostiquer le SSO.
+          diagnostics: outcome.timings,
         };
 
     const res = await workerFetch('/api/v1/runner/job-result', {
