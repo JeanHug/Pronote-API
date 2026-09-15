@@ -126,7 +126,7 @@ export default {
         // Coupe immédiatement les sessions lancées avec l'ancien workflow.
         // Elles partagent potentiellement encore le même token, mais ne
         // connaissent pas ce protocole et ne doivent plus réclamer de jobs v4.
-        if (request.headers.get('x-runner-protocol') !== '5') {
+        if (request.headers.get('x-runner-protocol') !== '6') {
           return json({ success: false, errorCode: 'UNAUTHORIZED', error: 'Protocole runner obsolète.' }, 426, cors);
         }
 
@@ -135,7 +135,7 @@ export default {
           if (!body) return json({ success: false, errorCode: 'INVALID_REQUEST', error: 'JSON invalide.' }, 400, cors);
           await doFetch('/heartbeat', {
             method: 'POST',
-            body: JSON.stringify({ ...body, protocolVersion: 5, logs: (body.logs || []).slice(-20) }),
+            body: JSON.stringify({ ...body, protocolVersion: 6, logs: (body.logs || []).slice(-20) }),
           });
           return json({ success: true, acknowledgedAt: Date.now() }, 200, cors);
         }

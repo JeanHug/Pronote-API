@@ -12,7 +12,7 @@ on:
 concurrency:
   # Suffixe v4 : évite qu'une ancienne session lancée avec le workflow v3
   # bloque la première relève v4 pendant plusieurs heures lors de la migration.
-  group: pronote-5h-runner-v4-single
+  group: pronote-5h-runner-v6-single
   # Le remplaçant attend la sortie propre de son prédécesseur au lieu de tuer
   # ses jobs en vol. L'ancienne valeur `true` provoquait les annulations en série.
   cancel-in-progress: false

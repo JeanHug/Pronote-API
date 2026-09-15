@@ -416,7 +416,7 @@ export class JobStore implements DurableObject {
       lastPing: number; runnerId: string; protocolVersion?: number;
     }>('heartbeat');
     const online = Boolean(
-      hb && hb.protocolVersion === 5 && Date.now() - hb.lastPing < HEARTBEAT_TTL_MS,
+      hb && hb.protocolVersion === 6 && Date.now() - hb.lastPing < HEARTBEAT_TTL_MS,
     );
     const pending = [...this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM jobs WHERE status = 'queued'`)][0]?.n ?? 0;
     return this.json({

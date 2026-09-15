@@ -47,7 +47,7 @@ request() {
   local name="$1" method="$2" path="$3" body="${4:-}" auth="${5:-}" ip="${6:-$DEFAULT_KEY}"
   local -a args=(-sS -o "$TMP/$name.body" -D "$TMP/$name.headers" -w '%{http_code}' -X "$method"
     -H 'Content-Type: application/json' -H "cf-connecting-ip: $ip")
-  [ -n "$auth" ] && args+=(-H "Authorization: Bearer $auth" -H 'X-Runner-Protocol: 5')
+  [ -n "$auth" ] && args+=(-H "Authorization: Bearer $auth" -H 'X-Runner-Protocol: 6')
   [ -n "$body" ] && args+=(--data "$body")
   curl "${args[@]}" "$BASE_URL$path" >"$TMP/$name.status"
 }
