@@ -99,7 +99,7 @@ async function workerFetch(path: string, init: RequestInit = {}): Promise<Respon
       headers: {
         'Authorization': `Bearer ${RUNNER_TOKEN}`,
         'Content-Type': 'application/json',
-        'X-Runner-Protocol': '4',
+        'X-Runner-Protocol': '5',
         'User-Agent': `Pronote-Runner/${RUNNER_ID}`,
         ...(init.headers ?? {}),
       },
