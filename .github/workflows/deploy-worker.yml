@@ -84,6 +84,10 @@ jobs:
               tail -80 /tmp/wrangler-deploy-safe.log
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
+            # Annotation lisible via l'API Checks même lorsque le stockage des
+            # logs Actions n'est pas joignable depuis l'environnement d'audit.
+            message="$(tail -40 /tmp/wrangler-deploy-safe.log | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')"
+            echo "::error title=Échec Wrangler::${message}"
           fi
           exit "$code"
 
