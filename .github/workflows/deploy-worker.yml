@@ -60,7 +60,32 @@ jobs:
         run: npm run check
 
       - name: Déployer la passerelle v4
-        run: npx wrangler deploy
+        shell: bash
+        run: |
+          set +e
+          npx wrangler deploy > /tmp/wrangler-deploy.log 2>&1
+          code=$?
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path('/tmp/wrangler-deploy.log').read_text(errors='replace')
+          # Défense en profondeur : aucun identifiant long, jeton ou valeur
+          # Authorization ne doit atteindre les logs ni le résumé du job.
+          text = re.sub(r'(?i)(authorization\s*:\s*(?:bearer\s+)?)[^\s]+', r'\1[REDACTED]', text)
+          text = re.sub(r'(?i)(token["\x27]?\s*[:=]\s*)[^\s]+', r'\1[REDACTED]', text)
+          text = re.sub(r'\b[0-9a-fA-F]{24,}\b', '[REDACTED]', text)
+          Path('/tmp/wrangler-deploy-safe.log').write_text(text)
+          PY
+          cat /tmp/wrangler-deploy-safe.log
+          if [ "$code" -ne 0 ]; then
+            {
+              echo '### Échec Wrangler (sortie assainie)'
+              echo '```text'
+              tail -80 /tmp/wrangler-deploy-safe.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$code"
 
       - name: Injecter les secrets du Worker
         shell: bash
