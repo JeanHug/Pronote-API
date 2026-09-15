@@ -15,9 +15,9 @@ Cette version corrige 103 problèmes identifiés dans l'audit (`AUDIT-PRONOTE-AP
 | **Cloudflare KV** comme file d'attente et bus de résultats | **Durable Object SQLite** | KV est *eventually consistent* : jusqu'à **60 s** de propagation, alors que la boucle d'attente était plafonnée à 50 s. L'API ne pouvait structurellement pas répondre — d'où les ~2 minutes observées. Un Durable Object est mono-thread et fortement cohérent. |
 | **Deux implémentations** du scraping, c'est la mauvaise qui tournait | **Une seule**, conforme au schéma | `pronoteExtractor.ts` (808 lignes, produisant les vraies données) n'était **importé par personne**. Le parseur exécuté décrivait 57 champs documentés dont 4 seulement existaient. |
 | Documentation écrite à la main | **Générée depuis le schéma** | La doc annonçait « 10-12 s » et un mode différé inutilisable. Désormais `tests/schema.test.ts` échoue si un champ documenté disparaît. |
-| Aucun test | **69 tests** | `tsc` et le build passaient : aucun des 103 bugs n'était détectable automatiquement. |
+| Aucun test | **73 tests** | `tsc` et le build passaient : aucun des 103 bugs n'était détectable automatiquement. |
 | Endpoints runner ouverts au public | **Authentifiés (fail-closed)** | `GET /api/runner/poll-job` distribuait les mots de passe ENT à quiconque appelait l'URL. |
-| Identifiants publiés en commentaire d'issue publique | **Plus jamais transmis hors du runner** | Chaque requête postait `{"username":…,"password":…}` sur l'issue #1, sur un dépôt public. |
+| Identifiants publiés en commentaire d'issue publique | **Confinés au flux Worker → Durable Object → runner** | Chaque requête postait `{"username":…,"password":…}` sur l'issue #1, sur un dépôt public. |
 | CORS `*` sur tous les endpoints | **Origines restreintes** | Les `jobId` étant prédictibles et `/api/job/:jobId` non authentifié, n'importe quel site pouvait lire les notes des élèves. |
 | PAT GitHub en clair dans `worker.js` | **Secret Wrangler uniquement** | Le token était « obfusqué » par un `.join("_")` — reconstituable en une ligne, et dans l'historique git. |
 
@@ -38,7 +38,7 @@ Cette version corrige 103 problèmes identifiés dans l'audit (`AUDIT-PRONOTE-AP
 
 ```bash
 npm install
-npm run check          # typecheck strict + 69 tests
+npm run check          # typecheck strict + 73 tests
 npm run dev            # wrangler dev (Worker en local)
 npm run deploy         # wrangler deploy
 npm run build:docs     # génère docs/index.html depuis le schéma
@@ -147,7 +147,7 @@ Il suffit d'interroger `statusUrl` jusqu'à obtenir un `200` (ou `502` en cas d'
 ## Tests
 
 ```bash
-npm test                          # 69 tests
+npm test                          # 73 tests
 npm run typecheck                 # tsc --noEmit, strict
 npx tsx --test tests/parse.test.ts  # un fichier en particulier
 ```
@@ -160,6 +160,7 @@ Les tests s'exécutent **hors ligne**, sur des fixtures HTML anonymisées. C'est
 | `tests/parse.test.ts` | Extraction complète sur fixtures, et **non-régression** des bugs corrigés |
 | `tests/schema.test.ts` | Chaque champ documenté existe réellement dans la sortie |
 | `tests/security.test.ts` | SSRF, assainissement des sessions, comparaison à temps constant |
+| `tests/budget.test.ts` | Attente sans scrutation, coût Durable Object, fenêtre fixe de débit |
 
 Le test le plus important est dans `schema.test.ts` : il résout chaque chemin documenté dans une réponse réelle. C'est ce qui rend impossible la dérive doc ↔ implémentation qui avait produit 53 champs fantômes.
 
@@ -169,9 +170,10 @@ Le test le plus important est dans `schema.test.ts` : il résout chaque chemin d
 
 Cette API manipule des données personnelles de mineurs. Trois garde-fous :
 
-- **Les identifiants ENT ne sortent jamais du runner.** Ils ne sont ni journalisés, ni publiés, ni stockés au-delà de la durée de vie du job (30 min en file, 1 h pour les résultats).
-- **Le rapport de test live est assaini sur dépôt public.** Les logs et artefacts d'un dépôt public sont lisibles par tout le monde : `scripts/live-test.ts` n'écrit la réponse intégrale que si le dépôt est privé.
-- **Aucune donnée d'élève n'est publiée sur GitHub.** Les diagnostics éventuellement postés en commentaire d'issue sont limités à `{ jobId, statut, code d'erreur, durée }`.
+- **Les identifiants ENT restent confinés au chemin d'exécution.** Ils transitent en HTTPS du client vers le Worker, sont conservés dans le Durable Object le temps du job, puis remis au runner. Ils ne sont jamais journalisés ni publiés, même tronqués, masqués ou hachés.
+- **Le rapport de test live est assaini par défaut dans les artefacts.** Les logs et artefacts d'un dépôt public sont lisibles par tout le monde ; aucun artefact ne contient donc la réponse complète.
+- **Publication complète uniquement sur autorisation explicite.** Les workflows `pronote-live.yml` et `live-test.yml` proposent `publier_reponse`. Avec `non`, seul le rapport assaini (compteurs, statuts, durées) est publié. Avec `oui`, la réponse API intégrale est découpée en commentaires sur l'issue publique #1 : elle contient des données scolaires et devient visible par tous. Ce mode sert au test live expressément autorisé par le propriétaire.
+- **Jamais d'identifiants dans GitHub.** Ni l'identifiant ENT ni le mot de passe ne sont journalisés ou publiés, même masqués ou hachés. Les diagnostics ordinaires restent limités à `{ jobId, statut, code d'erreur, durée }`.
 
 ---
 
@@ -196,7 +198,7 @@ pronote-standalone-runner/
   runner.ts             Boucle de session (~5 h)
   scraper.ts            Puppeteer : ENT → Pronote → captures DOM
 
-tests/                  69 tests + fixtures HTML anonymisées
+tests/                  73 tests + fixtures HTML anonymisées
 scripts/                Test live, génération de la doc
 ```
 
@@ -204,7 +206,8 @@ scripts/                Test live, génération de la doc
 
 ## Limites
 
-- **10 extractions/minute/IP.** File d'attente de 30 minutes, résultats conservés 1 heure.
+- **10 extractions/minute/IP.** La fenêtre est fixe à partir du premier appel ; un refus ne repousse pas l'échéance annoncée par `Retry-After`. File d'attente de 30 minutes, résultats conservés 1 heure.
+- **Budget Workers Free mesuré.** `/api/v1/health` expose `requetesDO`. Le chemin nominal utilise une requête `/wait` tenue ouverte au lieu d'une boucle toutes les 200 ms ; `tests/budget.test.ts` interdit le retour de cette régression.
 - **Le scraping est intrinsèquement lent** (~10-15 s) : il ouvre un navigateur et authentifie un SSO. La latence perçue dépend surtout de la disponibilité du runner.
 - **Un seul établissement par défaut.** `pronoteUrl` et `entUrl` sont paramétrables, mais la connexion ENT est écrite pour Seine-et-Marne (Alpine.js, `input[name=email]`). Un autre ENT demande un adaptateur.
 - **Pas de cache.** Un cache par `hash(username + pronoteUrl)` avec un TTL de 10 minutes réduirait fortement le coût, mais exposerait des données scolaires en mémoire partagée — décision à prendre explicitement.

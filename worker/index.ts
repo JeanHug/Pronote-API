@@ -25,8 +25,7 @@
 import { JobStore } from './jobstore.ts';
 import { dispatchRunner, postDiagnostic } from './github.ts';
 import {
-  safeEqual, extractBearer, validateScrapeBody, corsHeaders, json,
-  maskLogin, cleanText,
+  safeEqual, extractBearer, validateScrapeBody, corsHeaders, json, cleanText,
 } from './security.ts';
 import { renderDocs } from './docs.ts';
 import { FIELDS, ERROR_CATALOG, EXAMPLE, SCHEMA_VERSION } from '../src/pronote/schema.ts';
@@ -55,7 +54,6 @@ interface Env {
  * `GET /api/v1/job/:jobId` autant de fois que nécessaire.
  */
 const DEFAULT_SYNC_WAIT_MS = 25_000;
-const POLL_INTERVAL_MS = 200;
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -97,6 +95,9 @@ export default {
           runnerOnline: h.runnerOnline,
           runnerId: h.runnerId,
           queueDepth: h.queueDepth,
+          // Compteur persistant permettant une mesure avant/après du coût DO
+          // réel d'une extraction (objectif observé : 5 à 6 requêtes).
+          requetesDO: h.requetesDO,
           timestamp: new Date().toISOString(),
         }, 200, cors);
       }
@@ -134,10 +135,10 @@ export default {
           const body = await request.json<{ runnerId: string }>().catch(() => ({ runnerId: 'unknown' }));
           const res = await doFetch('/claim', { method: 'POST', body: JSON.stringify(body) });
           const data = await res.json<Record<string, unknown>>();
-          // On journalise l'identifiant MASQUÉ, jamais en clair.
+          // Aucun identifiant, même masqué ou haché, n'est journalisé.
           if (data.hasJob) {
-            const job = data.job as { jobId: string; username: string };
-            console.log(`[runner] job ${job.jobId} remis au runner (login ${maskLogin(job.username)})`);
+            const job = data.job as { jobId: string };
+            console.log(`[runner] job ${job.jobId} remis au runner.`);
           }
           return json(data, 200, cors);
         }
@@ -242,10 +243,16 @@ export default {
         const rlRes = await doFetch('/ratelimit', { method: 'POST', body: JSON.stringify({ key: ip }) });
         const rl = await rlRes.json<{ allowed: boolean; remaining: number; resetAt: number }>();
         if (!rl.allowed) {
+          const retryAfter = Math.max(1, Math.ceil((rl.resetAt - Date.now()) / 1000));
           return json({
             success: false, errorCode: 'RATE_LIMITED',
-            error: 'Trop de requêtes. Réessayez dans une minute.',
-          }, 429, { ...cors, 'Retry-After': '60', 'X-RateLimit-Remaining': '0' });
+            error: `Trop de requêtes. Réessayez dans ${retryAfter} seconde(s).`,
+          }, 429, {
+            ...cors,
+            'Retry-After': String(retryAfter),
+            'X-RateLimit-Remaining': '0',
+            'X-RateLimit-Reset': String(rl.resetAt),
+          });
         }
 
         // --- Validation stricte (dont protection SSRF) ---
@@ -284,33 +291,36 @@ export default {
           ctx.waitUntil(dispatchRunner(env, 'session_startup'));
         }
 
-        // --- Attente synchrone bornée ---
-        // Le Durable Object étant fortement cohérent, le résultat est visible
-        // dès son écriture : plus de fenêtre de 60 s comme avec KV.
-        const budget = Math.max(1_000, Number(env.SYNC_WAIT_MS ?? DEFAULT_SYNC_WAIT_MS));
-        const deadline = Date.now() + budget;
+        // --- Attente synchrone bornée, SANS SCRUTATION ---
+        // Une seule requête POST /wait reste ouverte dans le Durable Object.
+        // POST /result la réveille dès l'écriture SQLite. L'ancienne boucle à
+        // 200 ms coûtait jusqu'à 128 requêtes DO par extraction, limitant le
+        // service à ~781 extractions/jour malgré le quota de 100 000 requêtes.
+        const configuredBudget = Number(env.SYNC_WAIT_MS ?? DEFAULT_SYNC_WAIT_MS);
+        const budget = Math.max(
+          1_000,
+          Math.min(30_000, Number.isFinite(configuredBudget) ? configuredBudget : DEFAULT_SYNC_WAIT_MS),
+        );
+        if (noCache) { /* réservé : le cache n'est pas encore activé */ }
 
-        while (Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+        const waitRes = await doFetch('/wait', {
+          method: 'POST',
+          body: JSON.stringify({ jobId, timeoutMs: budget }),
+        });
+        const waited = await waitRes.json<{ status: string; result: string | null }>();
 
-          if (noCache) { /* réservé : le cache n'est pas encore activé */ }
-
-          const r = await doFetch(`/result?jobId=${encodeURIComponent(jobId)}`);
-          const d = await r.json<{ status: string; result: string | null }>();
-
-          if ((d.status === 'done' || d.status === 'error') && d.result) {
-            const headers: Record<string, string> = {
-              ...cors,
-              'X-Job-Id': jobId,
-              'X-RateLimit-Remaining': String(rl.remaining),
-              'X-Execution-Time-Ms': String(Date.now() - t0),
-            };
-            if (format === 'html') headers['X-Format'] = 'html';
-            return new Response(d.result, {
-              status: d.status === 'done' ? 200 : 502,
-              headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers },
-            });
-          }
+        if ((waited.status === 'done' || waited.status === 'error') && waited.result) {
+          const headers: Record<string, string> = {
+            ...cors,
+            'X-Job-Id': jobId,
+            'X-RateLimit-Remaining': String(rl.remaining),
+            'X-Execution-Time-Ms': String(Date.now() - t0),
+          };
+          if (format === 'html') headers['X-Format'] = 'html';
+          return new Response(waited.result, {
+            status: waited.status === 'done' ? 200 : 502,
+            headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers },
+          });
         }
 
         // --- Pas de résultat dans le budget : 202 + jobId EXPLOITABLE ---

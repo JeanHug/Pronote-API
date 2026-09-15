@@ -30,7 +30,7 @@
  *     deux fois (`html` + `rawHtml`). En mode JSON il n'est pas transmis du tout.
  */
 
-import puppeteer, { Browser, Page } from 'puppeteer';
+import puppeteer, { Browser, BrowserContext, Page } from 'puppeteer';
 import { parsePronote } from '../src/pronote/parse.ts';
 import type { ParseResult, PagesHTML } from '../src/pronote/parse.ts';
 import type { ErrorCode } from '../src/pronote/types.ts';
@@ -247,7 +247,9 @@ async function detectAuthError(page: Page): Promise<string | null> {
       'mot de passe incorrect',
     ].some((s) => body.includes(s));
 
-    if (txt && /incorrect|invalide|échec|echec/i.test(txt)) return txt;
+    // Ne jamais renvoyer le texte brut du serveur : certains fournisseurs
+    // réaffichent l'identifiant saisi dans leur message d'erreur.
+    if (txt && /incorrect|invalide|échec|echec/i.test(txt)) return 'Identifiant ou mot de passe ENT invalide.';
     if (onLogin && bad) return 'Identifiant ou mot de passe ENT invalide.';
     return null;
   }, null);
@@ -368,7 +370,7 @@ const TABS: TabSpec[] = [
  * commune : inutile de se réauthentifier pour chaque onglet.
  */
 async function captureTabs(
-  browser: Browser,
+  context: BrowserContext,
   pronoteUrl: string,
   log: (s: string) => void,
   timings: Record<string, number>,
@@ -378,7 +380,10 @@ async function captureTabs(
 
   const targets = await Promise.all(
     TABS.map(async (tab) => {
-      const p = await browser.newPage();
+      // Même BrowserContext que la page authentifiée : les cookies ENT/Pronote
+      // sont partagés. `browser.newPage()` ouvrirait le contexte par défaut et
+      // perdrait silencieusement la session SSO.
+      const p = await context.newPage();
       await p.setUserAgent(UA);
       await p.evaluateOnNewDocument(() => {
         (window as any).__name = (fn: unknown) => fn;
@@ -526,7 +531,7 @@ export async function runScrape(opts: ScrapeOptions): Promise<ScrapeOutcome> {
     await dismissModals(page);
 
     // --- 4. Onglets, en parallèle ---
-    const pages = await captureTabs(browser, pronoteUrl, log, timings);
+    const pages = await captureTabs(context, pronoteUrl, log, timings);
     pages.accueil = accueil;
     pages.pronoteBaseUrl = pronoteUrl;
     pages.entUrl = entUrl;

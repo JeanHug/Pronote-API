@@ -1,88 +1,64 @@
 name: Pronote 5-Hour Ephemeral Runner
 
 on:
-  push:
-    paths:
-      - 'pronote-standalone-runner/**'
-      - '.github/workflows/pronote-runner.yml'
-    branches:
-      - main
   workflow_dispatch:
   repository_dispatch:
     types: [start_runner]
+  # Filet de sécurité uniquement : le runner se relaie lui-même quatre minutes
+  # avant sa fin. Six heures évitent que le cron tue une session de 4 h 57.
   schedule:
-    - cron: '0 */5 * * *'
+    - cron: "0 */6 * * *"
 
 concurrency:
   group: pronote-5h-runner-single
-  cancel-in-progress: true
+  # Le remplaçant attend la sortie propre de son prédécesseur au lieu de tuer
+  # ses jobs en vol. L'ancienne valeur `true` provoquait les annulations en série.
+  cancel-in-progress: false
 
 permissions:
-  contents: write
-  issues: write
-  actions: write
+  contents: read
 
 jobs:
   pronote-runner:
-    name: "Pronote 5h Ephemeral Runner"
+    name: Pronote 5h Ephemeral Runner
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 300
+    env:
+      WORKER_URL: https://pronote-api.hugdu77777.workers.dev
+      RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN || secrets.GH_TOKEN }}
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
 
-      - name: Cache Runner Dependencies & Chromium
+      - name: Vérifier le token runner sans l'afficher
+        shell: bash
+        run: |
+          [ -n "$RUNNER_TOKEN" ] || { echo '::error::RUNNER_TOKEN et GH_TOKEN sont absents.'; exit 1; }
+
+      - name: Cache Chromium
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.npm
-            ~/.cache/puppeteer
-            pronote-standalone-runner/node_modules
-          key: ${{ runner.os }}-pronote-runner-v3-${{ hashFiles('pronote-standalone-runner/package.json') }}
-          restore-keys: |
-            ${{ runner.os }}-pronote-runner-v3-
+          path: ~/.cache/puppeteer
+          key: ${{ runner.os }}-chrome-${{ hashFiles('package-lock.json') }}
 
-      - name: Install System Dependencies for Chromium
+      - name: Dépendances système Chromium
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
             libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1
-          sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2 || true
+          sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
 
-      - name: Install Runner Dependencies
+      - name: Installation reproductible et Chromium
         run: |
-          cd pronote-standalone-runner
-          npm install
+          npm ci
           npx puppeteer browsers install chrome
 
-      - name: Start Ephemeral Pronote Extraction Loop
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WORKER_URL: https://pronote-api.hugdu77777.workers.dev
-          GITHUB_OWNER: JeanHug
-          GITHUB_REPO: Pronote-API
-        run: |
-          echo "🚀 Démarrage du nouveau récupérateur de données Pronote 5h..."
-          cd pronote-standalone-runner
-          npx tsx runner.ts
-
-      - name: "Auto-Relay: Trigger next 5h Runner before shutdown"
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "🔄 Déclenchement automatique de la relève 5h..."
-          AUTH_TOKEN="${GH_TOKEN:-$GITHUB_TOKEN}"
-          curl -X POST \
-            -H "Authorization: Bearer $AUTH_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/JeanHug/Pronote-API/dispatches \
-            -d '{"event_type":"start_runner"}' || true
+      - name: Démarrer la session éphémère
+        run: npx tsx pronote-standalone-runner/runner.ts

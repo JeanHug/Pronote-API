@@ -1,0 +1,128 @@
+name: Pronote complet v4
+
+on:
+  repository_dispatch:
+    types: [pronote_complet]
+  workflow_dispatch:
+    inputs:
+      publier_reponse:
+        description: "Publier la réponse API complète sur l’issue publique #1"
+        required: true
+        type: choice
+        default: oui
+        options: [oui, non]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: pronote-complet-v4
+  cancel-in-progress: false
+
+jobs:
+  deployer-et-tester:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      WORKER_URL: https://pronote-api.hugdu77777.workers.dev
+      API_BASE: https://pronote-api.hugdu77777.workers.dev
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ID }}
+      WORKER_GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+      WORKER_RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN || secrets.GH_TOKEN }}
+      ENT_ID: ${{ secrets.ENT_ID }}
+      ENT_PASS: ${{ secrets.ENT_PASS }}
+      PUBLIER_REPONSE: ${{ github.event.client_payload.publier_reponse || inputs.publier_reponse || 'oui' }}
+    steps:
+      - name: Checkout de main
+        uses: actions/checkout@v4
+
+      - name: Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Vérifier les secrets sans lire ni afficher leur valeur
+        shell: bash
+        run: |
+          missing=0
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID WORKER_GITHUB_TOKEN WORKER_RUNNER_TOKEN ENT_ID ENT_PASS; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret requis absent : ${name}"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Installation reproductible
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "true"
+        run: npm ci
+
+      - name: TypeScript strict et 73 tests
+        run: npm run check
+
+      - name: Déploiement du Worker v4
+        run: npx wrangler deploy
+
+      - name: Réinjecter GITHUB_TOKEN et RUNNER_TOKEN dans le Worker
+        shell: bash
+        run: |
+          set +x
+          printf '%s' "$WORKER_GITHUB_TOKEN" | npx wrangler secret put GITHUB_TOKEN
+          printf '%s' "$WORKER_RUNNER_TOKEN" | npx wrangler secret put RUNNER_TOKEN
+
+      - name: Vérifier impérativement la signature v4 avant tout scrape
+        id: health_before
+        shell: bash
+        run: |
+          response="$(curl --fail --silent --show-error "$WORKER_URL/api/v1/health")"
+          jq -e '.version == "4.0.0" and .storage == "Durable Object SQLite (KV supprimé)"' <<<"$response" >/dev/null
+          jq -r '.requetesDO // 0' <<<"$response" > /tmp/requetes-do-avant
+          echo 'Worker v4.0.0 actif — Durable Object SQLite confirmé. La v3 n’est plus appelée.'
+
+      - name: Installer Chromium pour le test réel
+        run: npx puppeteer browsers install chrome
+
+      - name: Extraction ENT réelle puis appel de l'API v4
+        id: live
+        run: npx tsx scripts/live-test.ts
+
+      - name: Mesurer le coût Durable Object
+        if: always() && steps.health_before.outcome == 'success'
+        shell: bash
+        run: |
+          response="$(curl --fail --silent --show-error "$WORKER_URL/api/v1/health")"
+          apres="$(jq -r '.requetesDO // 0' <<<"$response")"
+          avant="$(cat /tmp/requetes-do-avant)"
+          delta=$((apres - avant))
+          echo "Requêtes Durable Object observées pendant la campagne : $delta"
+          if [ "$delta" -gt 20 ]; then
+            echo "::warning::Le coût observé dépasse 20 requêtes DO (le runner ou un autre test a pu contribuer en parallèle)."
+          fi
+
+      - name: Publier la réponse choisie sur l'issue #1
+        if: always() && steps.health_before.outcome == 'success'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if [ "$PUBLIER_REPONSE" = 'oui' ] && [ -f rapports/reponse-complete.json ]; then
+            npx tsx scripts/publish-response.ts rapports/reponse-complete.json
+          elif [ -f rapports/rapport-public.json ]; then
+            npx tsx scripts/publish-response.ts rapports/rapport-public.json
+          else
+            echo '::error::Aucun rapport disponible à publier.'
+            exit 1
+          fi
+
+      - name: Archiver uniquement le rapport assaini
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapport-pronote-assaini
+          path: rapports/rapport-public.json
+          if-no-files-found: warn
+          retention-days: 7

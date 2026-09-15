@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   safeEqual, extractBearer, validateScrapeUrl, stripSessionParams,
-  cleanText, maskLogin, validateScrapeBody,
+  cleanText, validateScrapeBody,
 } from '../worker/security.ts';
 
 // ===========================================================================
@@ -135,19 +135,13 @@ test('cleanText retire les caractères de contrôle et borne la longueur', () =>
   assert.equal(cleanText(42), '');
 });
 
-test('maskLogin ne révèle jamais un identifiant en clair', () => {
-  // On vérifie la PROPRIÉTÉ (rien de sensible ne fuit), pas le nombre exact
-  // d'astérisques : c'est le comportement qui compte, pas la mise en forme.
-  const masked = maskLogin('jean.dupont@ent.fr');
-  assert.ok(masked.startsWith('je'), 'les 2 premiers caractères servent à identifier le job');
-  assert.ok(!masked.includes('dupont'), 'le nom ne doit pas apparaître');
-  assert.ok(!masked.includes('@'), 'le domaine ne doit pas apparaître');
-  assert.ok(masked.length < 'jean.dupont@ent.fr'.length, 'la sortie doit être plus courte que l\'entrée');
-
-  // Chaînes courtes : masquage intégral.
-  assert.equal(maskLogin('ab'), '**');
-  assert.equal(maskLogin('a'), '**');
-  assert.equal(maskLogin(''), '(vide)');
+test("extractBearer n'accepte aucun secret dans l'URL ou les cookies", () => {
+  // Les secrets ne doivent être lus que depuis les deux en-têtes prévus. Une
+  // query string ou un cookie finirait facilement dans des journaux d'accès.
+  const request = new Request('https://x.test/?token=secret-url', {
+    headers: { Cookie: 'token=secret-cookie' },
+  });
+  assert.equal(extractBearer(request), null);
 });
 
 // ===========================================================================

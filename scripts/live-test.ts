@@ -11,10 +11,11 @@
  *     codes d'erreur. Aucun nom, aucune note, aucune URL d'établissement.
  *     Publiable sans risque, y compris sur un dépôt public.
  *
- *  2. `reponse-complete.json` — la réponse API intégrale. Écrit uniquement si le
- *     dépôt est PRIVÉ. Sur un dépôt public, les logs et les artefacts de
- *     workflow sont visibles par tout le monde : y déposer les notes et le nom
- *     d'un élève mineur serait une fuite de données personnelles.
+ *  2. `reponse-complete.json` — la réponse API intégrale, octet pour octet.
+ *     Écrit uniquement si le dépôt est privé OU si `PUBLIER_REPONSE=oui` a été
+ *     choisi explicitement. Sur un dépôt public, ce choix rend les données
+ *     scolaires visibles publiquement : le workflow dédié l'annonce avant de
+ *     publier, et ne journalise jamais leur contenu.
  */
 
 import { writeFileSync, mkdirSync } from 'node:fs';
@@ -26,6 +27,7 @@ const ENT_PASS = process.env.ENT_PASS || '';
 const PRONOTE_URL = process.env.PRONOTE_URL?.trim() || 'https://0771068t.index-education.net/pronote/eleve.html';
 const ENT_URL = process.env.ENT_URL?.trim() || 'https://ent.seine-et-marne.fr/';
 const API_BASE = process.env.API_BASE?.trim() || '';
+const PUBLIER_REPONSE = (process.env.PUBLIER_REPONSE || '').trim().toLowerCase() === 'oui';
 
 function fail(msg: string): never {
   console.error(`ERREUR : ${msg}`);
@@ -77,7 +79,9 @@ function rapportPublic(
     succes: success,
     dureeTotaleMs: executionTimeMs,
     codeErreur: errorCode ?? null,
-    messageErreur: error ?? null,
+    // Le message brut peut provenir du SSO et réafficher l'identifiant. Le
+    // rapport public conserve uniquement le fait qu'un détail était présent.
+    messageErreur: error ? 'Détail d’erreur masqué dans le rapport public.' : null,
     modules: (report?.modules ?? []).map((m) => ({
       module: m.module,
       statut: m.status,
@@ -108,6 +112,7 @@ function rapportPublic(
 async function main(): Promise<void> {
   const t0 = Date.now();
   let apiReponse: unknown = null;
+  let apiReponseBrute: string | null = null;
   let resultatDirect: Awaited<ReturnType<typeof runScrape>> | null = null;
 
   // -------------------------------------------------------------------------
@@ -115,7 +120,8 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   console.log('── Extraction directe ─────────────────────────────');
   console.log(`Cible établissement : ${new URL(PRONOTE_URL).hostname}`);
-  console.log(`Identifiant        : ${ENT_ID.slice(0, 2)}${'*'.repeat(Math.min(Math.max(ENT_ID.length - 2, 0), 10))} (masqué)`);
+  // Aucun identifiant n'est affiché, même tronqué, masqué ou haché.
+  console.log('Identifiants       : fournis par l’environnement sécurisé (non affichés)');
   console.log('');
 
   resultatDirect = await runScrape({
@@ -140,7 +146,8 @@ async function main(): Promise<void> {
   console.log('');
   console.log(`Résultat : ${rapport.succes ? 'SUCCÈS' : 'ÉCHEC'} en ${(rapport.dureeTotaleMs / 1000).toFixed(2)} s`);
   if (rapport.codeErreur) console.log(`Code d'erreur : ${rapport.codeErreur}`);
-  if (rapport.messageErreur) console.log(`Message : ${rapport.messageErreur}`);
+  // Le détail d'erreur peut provenir d'un fournisseur SSO et n'est jamais
+  // journalisé : certains réaffichent l'identifiant saisi.
   console.log('');
   console.log('Modules extraits :');
   for (const m of rapport.modules) {
@@ -154,11 +161,30 @@ async function main(): Promise<void> {
   if (API_BASE) {
     console.log('');
     console.log('── Appel de l\'API déployée ───────────────────────');
+
+    const base = API_BASE.replace(/\/$/, '');
+
+    // GARDE-FOU CRITIQUE : la v3 publiait le job complet, mot de passe inclus,
+    // dans un commentaire d'issue publique. Aucun POST /scrape n'est effectué
+    // tant que la signature v4 + Durable Object n'est pas prouvée.
+    const healthRes = await fetch(`${base}/api/v1/health`);
+    const healthText = await healthRes.text();
+    let health: { version?: string; storage?: string } = {};
+    try { health = JSON.parse(healthText) as typeof health; } catch { /* contrôlé ci-dessous */ }
+    if (
+      !healthRes.ok ||
+      health.version !== '4.0.0' ||
+      health.storage !== 'Durable Object SQLite (KV supprimé)'
+    ) {
+      throw new Error('API_NON_V4 : appel /scrape interdit pour empêcher toute publication d’identifiants par l’ancienne passerelle.');
+    }
+    console.log('Passerelle vérifiée : v4.0.0, stockage Durable Object SQLite.');
+
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 120_000);
 
-      const res = await fetch(`${API_BASE.replace(/\/$/, '')}/api/v1/scrape-pronote`, {
+      const res = await fetch(`${base}/api/v1/scrape-pronote`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         // Le corps n'est jamais journalisé.
@@ -174,25 +200,31 @@ async function main(): Promise<void> {
 
       console.log(`HTTP ${res.status} — durée mesurée côté client : ${((Date.now() - t0) / 1000).toFixed(2)} s`);
 
-      apiReponse = await res.json();
+      apiReponseBrute = await res.text();
+      apiReponse = JSON.parse(apiReponseBrute) as unknown;
 
       // En cas de 202, on suit le job jusqu'à obtention du résultat.
       const r = apiReponse as { status?: string; jobId?: string };
       if (res.status === 202 && r.jobId) {
-        console.log(`Job ${r.jobId} en cours, suivi automatique…`);
-        for (let i = 0; i < 60; i++) {
+        console.log('Job API en cours, suivi automatique…');
+        let termine = false;
+        for (let i = 0; i < 300; i++) {
           await new Promise((x) => setTimeout(x, 3000));
-          const jr = await fetch(`${API_BASE.replace(/\/$/, '')}/api/v1/job/${encodeURIComponent(r.jobId)}`);
+          const jr = await fetch(`${base}/api/v1/job/${encodeURIComponent(r.jobId)}`);
           if (jr.status !== 202) {
-            apiReponse = await jr.json();
+            apiReponseBrute = await jr.text();
+            apiReponse = JSON.parse(apiReponseBrute) as unknown;
             console.log(`Résultat obtenu après ${i + 1} interrogation(s).`);
+            termine = true;
             break;
           }
         }
+        if (!termine) throw new Error('Le job API est resté en cours pendant 15 minutes.');
       }
     } catch (err) {
       console.log(`Appel API impossible : ${(err as Error).message}`);
       apiReponse = { erreur: (err as Error).message };
+      apiReponseBrute = JSON.stringify(apiReponse, null, 2);
     }
   } else {
     console.log('');
@@ -211,22 +243,20 @@ async function main(): Promise<void> {
   );
 
   const prive = await repoEstPrive();
-  if (prive) {
-    writeFileSync(
-      'rapports/reponse-complete.json',
-      JSON.stringify({
-        reponseApi: apiReponse,
-        extractionDirecte: resultatDirect.payload ?? null,
-      }, null, 2),
-      'utf8',
-    );
+  if (prive || PUBLIER_REPONSE) {
+    // Le fichier contient EXACTEMENT la réponse de l'API déployée, sans
+    // enveloppe ni reformulation. Il n'est jamais envoyé comme artefact public :
+    // le workflow le découpe directement en commentaires si cela a été autorisé.
+    const contenuComplet = apiReponseBrute
+      ?? JSON.stringify(apiReponse ?? resultatDirect.payload ?? null, null, 2);
+    writeFileSync('rapports/reponse-complete.json', contenuComplet, 'utf8');
     console.log('');
-    console.log('Rapport complet écrit (dépôt privé).');
+    console.log(prive
+      ? 'Réponse API complète écrite (dépôt privé).'
+      : '⚠️  Publication publique explicitement autorisée : réponse API complète prête à être publiée.');
   } else {
     console.log('');
-    console.log('⚠️  Dépôt public : le rapport complet n\'est PAS écrit.');
-    console.log('   Les logs et artefacts de workflow d\'un dépôt public sont visibles par tout le monde.');
-    console.log('   Pour récupérer la réponse intégrale, passez le dépôt en privé, ou lancez le runner en local.');
+    console.log('Dépôt public : seule la version assainie est produite (PUBLIER_REPONSE ≠ oui).');
   }
 
   console.log('');
@@ -246,7 +276,7 @@ function assainirReponseApi(reponse: unknown): unknown {
     status: r.status ?? null,
     executionTimeMs: r.executionTimeMs ?? null,
     errorCode: r.errorCode ?? null,
-    error: r.error ?? null,
+    error: r.error ? 'Détail d’erreur masqué dans le rapport public.' : null,
     statusUrl: r.statusUrl ?? null,
   };
   if (r.extraction) {

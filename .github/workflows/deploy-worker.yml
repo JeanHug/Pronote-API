@@ -1,0 +1,77 @@
+name: Deploy Worker v4
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "worker/**"
+      - "src/pronote/**"
+      - "wrangler.toml"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/deploy-worker.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-pronote-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ID }}
+      WORKER_GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+      WORKER_RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN || secrets.GH_TOKEN }}
+      WORKER_URL: https://pronote-api.hugdu77777.workers.dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Vérifier la présence des secrets requis
+        shell: bash
+        run: |
+          missing=0
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID WORKER_GITHUB_TOKEN WORKER_RUNNER_TOKEN; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret requis absent : ${name}"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Installer
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "true"
+        run: npm ci
+
+      - name: Vérifications
+        run: npm run check
+
+      - name: Déployer la passerelle v4
+        run: npx wrangler deploy
+
+      - name: Injecter les secrets du Worker
+        shell: bash
+        run: |
+          set +x
+          printf '%s' "$WORKER_GITHUB_TOKEN" | npx wrangler secret put GITHUB_TOKEN
+          printf '%s' "$WORKER_RUNNER_TOKEN" | npx wrangler secret put RUNNER_TOKEN
+
+      - name: Prouver que la v3 n'est plus en service
+        shell: bash
+        run: |
+          response="$(curl --fail --silent --show-error "$WORKER_URL/api/v1/health")"
+          jq -e '.version == "4.0.0" and .storage == "Durable Object SQLite (KV supprimé)"' <<<"$response" >/dev/null
+          echo 'Worker v4.0.0 actif — Durable Object SQLite confirmé.'
