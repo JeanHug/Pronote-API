@@ -123,11 +123,20 @@ export default {
         if (!authed) {
           return json({ success: false, errorCode: 'UNAUTHORIZED', error: 'Token runner invalide ou absent.' }, 401, cors);
         }
+        // Coupe immédiatement les sessions lancées avec l'ancien workflow.
+        // Elles partagent potentiellement encore le même token, mais ne
+        // connaissent pas ce protocole et ne doivent plus réclamer de jobs v4.
+        if (request.headers.get('x-runner-protocol') !== '4') {
+          return json({ success: false, errorCode: 'UNAUTHORIZED', error: 'Protocole runner obsolète.' }, 426, cors);
+        }
 
         if (url.pathname.endsWith('/heartbeat')) {
           const body = await request.json<{ runnerId: string; status?: string; logs?: string[] }>().catch(() => null);
           if (!body) return json({ success: false, errorCode: 'INVALID_REQUEST', error: 'JSON invalide.' }, 400, cors);
-          await doFetch('/heartbeat', { method: 'POST', body: JSON.stringify({ ...body, logs: (body.logs || []).slice(-20) }) });
+          await doFetch('/heartbeat', {
+            method: 'POST',
+            body: JSON.stringify({ ...body, protocolVersion: 4, logs: (body.logs || []).slice(-20) }),
+          });
           return json({ success: true, acknowledgedAt: Date.now() }, 200, cors);
         }
 

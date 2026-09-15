@@ -58,7 +58,9 @@ function chunksOf(text: string, maxBytes = 48_000): string[] {
 // humains et diagnostics sans ce marqueur sont laissés intacts.
 const old = await gh(`/issues/${issue}/comments?per_page=100`).then((r) => r.json()) as Array<{ id: number; body?: string }>;
 for (const comment of old) {
-  if (comment.body?.includes('<!-- pronote-live-response -->')) {
+  const body = comment.body || '';
+  const previousMode = body.match(/<!-- run:[^;]+;mode:([^;]+);part:/)?.[1];
+  if (body.includes('<!-- pronote-live-response -->') && previousMode === mode) {
     await gh(`/issues/comments/${comment.id}`, { method: 'DELETE' });
   }
 }

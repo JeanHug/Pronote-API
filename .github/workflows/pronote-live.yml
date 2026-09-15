@@ -109,13 +109,18 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          if [ "$PUBLIER_REPONSE" = 'oui' ] && [ -f rapports/reponse-complete.json ]; then
-            npx tsx scripts/publish-response.ts rapports/reponse-complete.json
-          elif [ -f rapports/rapport-public.json ]; then
-            npx tsx scripts/publish-response.ts rapports/rapport-public.json
+          if [ -f rapports/rapport-public.json ]; then
+            PUBLIER_REPONSE=non npx tsx scripts/publish-response.ts rapports/rapport-public.json
           else
-            echo '::error::Aucun rapport disponible à publier.'
+            echo '::error::Rapport public absent.'
             exit 1
+          fi
+          if [ "$PUBLIER_REPONSE" = 'oui' ]; then
+            if [ ! -f rapports/reponse-complete.json ]; then
+              echo '::error::Réponse complète absente malgré l’autorisation de publication.'
+              exit 1
+            fi
+            PUBLIER_REPONSE=oui npx tsx scripts/publish-response.ts rapports/reponse-complete.json
           fi
 
       - name: Archiver uniquement le rapport assaini
