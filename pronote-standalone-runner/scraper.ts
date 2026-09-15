@@ -424,20 +424,21 @@ async function captureTabs(
       timings[`${tab.key}ContenuPret`] = ready ? 1 : 0;
       await new Promise((r) => setTimeout(r, 300)); // stabilisation AngularJS
 
-      const html = await snapshot(page);
-      (pages as Record<string, string>)[tab.key] = html;
-      // `String.length` suffit au diagnostic et ne dépend d'aucun global Node.
-      timings[`${tab.key}Caracteres`] = html.length;
-      timings[tab.key] = Date.now() - t;
     } catch (err) {
-      const message = (err as Error).message || '';
-      log(`Capture « ${tab.key} » en erreur (${(err as Error).name || 'Error'}).`);
-      (pages as Record<string, string>)[tab.key] = '';
+      const error = err instanceof Error ? err : new Error('Erreur de capture sans détail');
+      const message = error.message || '';
+      log(`Capture « ${tab.key} » en erreur (${error.name || 'Error'}).`);
       timings[`${tab.key}Erreur`] = 1;
       timings[`${tab.key}ErreurBuffer`] = /Buffer/i.test(message) ? 1 : 0;
       timings[`${tab.key}ErreurCibleFermee`] = /Target|closed|Session/i.test(message) ? 1 : 0;
-      timings[tab.key] = Date.now() - t;
     } finally {
+      // Même si la navigation ou un sélecteur échoue, on conserve le DOM
+      // courant au lieu d'écraser la page par une chaîne vide. Cela permet au
+      // parseur et aux stratégies de repli de travailler sur ce qui est chargé.
+      const html = await snapshot(page);
+      (pages as Record<string, string>)[tab.key] = html;
+      timings[`${tab.key}Caracteres`] = html.length;
+      timings[tab.key] = Date.now() - t;
       await page.close().catch(() => null);
     }
   }));
@@ -543,6 +544,11 @@ export async function runScrape(opts: ScrapeOptions): Promise<ScrapeOutcome> {
 
     // --- 4. Onglets, en parallèle ---
     const pages = await captureTabs(context, pronoteUrl, log, timings);
+    // Mesure redondante hors de la boucle de capture : garantit que le rapport
+    // indique toujours si chaque DOM a effectivement été conservé.
+    for (const tab of TABS) {
+      timings[`${tab.key}CaptureCaracteres`] = (pages[tab.key] || '').length;
+    }
     pages.accueil = accueil;
     pages.pronoteBaseUrl = pronoteUrl;
     pages.entUrl = entUrl;
