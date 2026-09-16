@@ -101,6 +101,11 @@ jobs:
       - name: Prouver que la v3 n'est plus en service
         shell: bash
         run: |
-          response="$(curl --fail --silent --show-error "$WORKER_URL/api/v1/health")"
-          jq -e '.version == "4.0.0" and .storage == "Durable Object SQLite (KV supprimé)"' <<<"$response" >/dev/null
+          response="$(curl --silent --show-error --write-out '\n__HTTP_STATUS__%{http_code}' "$WORKER_URL/api/v1/health" || true)"
+          status="${response##*__HTTP_STATUS__}"
+          body="${response%__HTTP_STATUS__*}"
+          echo "Health HTTP status: $status"
+          echo "$body"
+          test "$status" = 200
+          jq -e '.version == "4.0.0" and .storage == "Durable Object SQLite (KV supprimé)"' <<<"$body" >/dev/null
           echo 'Worker v4.0.0 actif — Durable Object SQLite confirmé.'
