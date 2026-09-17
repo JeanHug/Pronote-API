@@ -1,435 +1,163 @@
-/**
- * PRONOTE API — PASSERELLE CLOUDFLARE WORKERS
- * ==========================================
- * Architecture : Worker (edge) + Durable Object (état cohérent) + Runner
- * GitHub Actions (navigateur).
- *
- * Remplace l'ancien `worker.js`, qui utilisait Cloudflare KV comme file
- * d'attente ET bus de résultats — un stockage *eventually consistent* dont la
- * latence de propagation atteint 60 s, alors que la boucle d'attente était
- * plafonnée à 50 s. L'API ne pouvait donc pas répondre. Voir AUDIT, section 1.
- *
- * Ce qui a changé :
- *  - KV supprimé intégralement → Durable Object à cohérence forte (jobstore.ts)
- *  - Les endpoints runner sont AUTHENTIFIÉS (l'ancien `/api/runner/poll-job`
- *    distribuait les mots de passe ENT à qui les demandait)
- *  - Les mots de passe ne sont PLUS publiés en commentaire d'issue publique
- *  - Le timeout renvoie un `jobId` exploitable au lieu d'un 504 sans référence
- *  - CORS restreint (l'ancien `*` permettait à tout site de lire les notes)
- *  - Validation d'URL contre la SSRF
- *  - `jobId` non devinable (crypto.randomUUID au lieu de Date.now + 6 car.)
- *  - Limitation de débit par IP
- *  - Documentation générée depuis le schéma, donc jamais désynchronisée
- */
+import { DurableObject } from 'cloudflare:workers';
+import { VERSION, ApiError, validateCredentials, safeFailure, summarize, assertNoCredentials, type Credentials, type ExtractionResult } from '../src/pronote/contracts';
+import { digest, equalSecret, randomToken, seal, unseal } from './crypto';
+import { documentation } from './docs';
 
-import { JobStore } from './jobstore.ts';
-import { dispatchRunner, postDiagnostic } from './github.ts';
-import {
-  safeEqual, extractBearer, validateScrapeBody, corsHeaders, json, cleanText,
-} from './security.ts';
-import { renderDocs } from './docs.ts';
-import { FIELDS, ERROR_CATALOG, EXAMPLE, SCHEMA_VERSION } from '../src/pronote/schema.ts';
-import type { ErrorCode } from '../src/pronote/types.ts';
-
-export { JobStore };
-
-interface Env {
-  JOB_STORE: DurableObjectNamespace;
-  GITHUB_TOKEN?: string;
-  GITHUB_OWNER?: string;
-  GITHUB_REPO?: string;
-  GITHUB_FALLBACK_ISSUE?: string;
-  RUNNER_TOKEN?: string;
-  API_KEYS?: string;
-  ALLOWED_ORIGINS?: string;
-  ALLOWED_HOST_SUFFIXES?: string;
-  SYNC_WAIT_MS?: string;
-  DEFAULT_PRONOTE_URL?: string;
-  DEFAULT_ENT_URL?: string;
+interface Env { COORDINATOR: DurableObjectNamespace<Coordinator>; DATA_KEY: string; RUNNER_TOKEN: string; GITHUB_TOKEN: string; GITHUB_OWNER: string; GITHUB_REPO: string; API_KEYS?: string; ALLOWED_ORIGINS?: string }
+type JobRow = { id:string; ownerHash:string; state:string; request:string|null; result:string|null; lease:string|null; runner:string|null; created:number; deadline:number };
+interface RunnerRow { id:string; until:number; draining:boolean; revision:string }
+const headers = { 'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer' };
+const json = (value:unknown,status=200,extra:Record<string,string>={}) => new Response(JSON.stringify(value),{status,headers:{...headers,...extra}});
+async function body(request:Request,limit=8192):Promise<unknown>{
+  if(Number(request.headers.get('content-length')||0)>limit)throw new ApiError('BODY_TOO_LARGE',413,'validation','Requête trop volumineuse.');
+  if(!request.headers.get('content-type')?.includes('application/json'))throw new ApiError('INVALID_CONTENT_TYPE',415,'validation','Content-Type application/json est requis.');
+  const reader=request.body?.getReader();let size=0;const chunks:Uint8Array[]=[];
+  if(!reader)throw new ApiError('INVALID_REQUEST',400,'validation','Corps absent.');
+  for(;;){const r=await reader.read();if(r.done)break;size+=r.value.byteLength;if(size>limit){await reader.cancel();throw new ApiError('BODY_TOO_LARGE',413,'validation','Requête trop volumineuse.');}chunks.push(r.value);}
+  const buffer=new Uint8Array(size);let offset=0;for(const c of chunks){buffer.set(c,offset);offset+=c.length;}
+  try{return JSON.parse(new TextDecoder().decode(buffer));}catch{throw new ApiError('INVALID_JSON',400,'validation','JSON invalide.');}
 }
+function bearer(request:Request):string {return request.headers.get('authorization')?.replace(/^Bearer\s+/i,'')||request.headers.get('x-api-key')||'';}
 
-/**
- * Budget d'attente synchrone. Au-delà, l'API renvoie 202 avec un jobId
- * exploitable plutôt que d'échouer — l'appelant peut alors interroger
- * `GET /api/v1/job/:jobId` autant de fois que nécessaire.
- */
-const DEFAULT_SYNC_WAIT_MS = 25_000;
+export class Coordinator extends DurableObject<Env> {
+  private wakeClaim:(()=>void)|undefined;
+  private waiters=new Map<string,()=>void>();
+  constructor(ctx:DurableObjectState,env:Env){
+    super(ctx,env);
+    ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, ownerHash TEXT NOT NULL, state TEXT NOT NULL, request TEXT, result TEXT, lease TEXT, runner TEXT, created INTEGER NOT NULL, deadline INTEGER NOT NULL)');
+    ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS limits (key TEXT PRIMARY KEY, count INTEGER NOT NULL, until INTEGER NOT NULL)');
+    ctx.blockConcurrencyWhile(async()=>{if(await ctx.storage.getAlarm()===null)await ctx.storage.setAlarm(Date.now()+60000);});
+  }
+  private read(id:string):JobRow|undefined{return [...this.ctx.storage.sql.exec<JobRow>('SELECT * FROM jobs WHERE id = ?',id)][0];}
+  private async health(){
+    const runner=await this.ctx.storage.get<RunnerRow>('runner');
+    const online=!!runner&&runner.until>Date.now()&&!runner.draining;
+    const queued=[...this.ctx.storage.sql.exec<{n:number}>('SELECT COUNT(*) AS n FROM jobs WHERE state = ?', 'queued')][0]?.n||0;
+    const running=[...this.ctx.storage.sql.exec<{n:number}>('SELECT COUNT(*) AS n FROM jobs WHERE state = ?', 'running')][0]?.n||0;
+    return {version:VERSION,status:online?'ready':'waiting_for_runner',runnerOnline:online,runnerRevision:runner?.revision||null,queueDepth:queued,running,transport:'encrypted-durable-object',credentialsRetention:'until claim (maximum 3 minutes)',resultsRetentionSeconds:300,lastExtraction:await this.ctx.storage.get('lastExtraction')||null,timestamp:new Date().toISOString()};
+  }
+  private async dispatch(reason:string,force=false):Promise<boolean>{
+    const now=Date.now();const last=await this.ctx.storage.get<number>('lastDispatch')||0;
+    if(!force&&now-last<90000)return true;
+    await this.ctx.storage.put('lastDispatch',now);
+    try{
+      const r=await fetch(`https://api.github.com/repos/${this.env.GITHUB_OWNER}/${this.env.GITHUB_REPO}/dispatches`,{method:'POST',headers:{Authorization:`Bearer ${this.env.GITHUB_TOKEN}`,Accept:'application/vnd.github+json','Content-Type':'application/json','User-Agent':'Pronote-v5','X-GitHub-Api-Version':'2022-11-28'},body:JSON.stringify({event_type:'pronote_runner_v5',client_payload:{reason}}),signal:AbortSignal.timeout(10000)});
+      if(r.status!==204){await this.ctx.storage.delete('lastDispatch');return false;}return true;
+    }catch{await this.ctx.storage.delete('lastDispatch');return false;}
+  }
+  private async expire(){
+    const expired=[...this.ctx.storage.sql.exec<JobRow>("SELECT * FROM jobs WHERE deadline < ? AND state IN ('queued','running')",Date.now())];
+    for(const row of expired){
+      const failure=safeFailure(new ApiError(row.state==='queued'?'RUNNER_UNAVAILABLE':'JOB_INTERRUPTED',503,'runner',row.state==='queued'?'Aucun moteur disponible dans le délai. Relancez la demande.':'Le moteur n’a pas remis le résultat dans le délai. Relancez la demande.'));
+      this.ctx.storage.sql.exec('UPDATE jobs SET state = ?, request = NULL, result = ?, deadline = ? WHERE id = ?', 'error',await seal(failure,this.env.DATA_KEY),Date.now()+300000,row.id);
+      this.waiters.get(row.id)?.();
+    }
+    this.ctx.storage.sql.exec("DELETE FROM jobs WHERE state IN ('done','error') AND deadline < ?",Date.now());
+    this.ctx.storage.sql.exec('DELETE FROM limits WHERE until < ?',Date.now());
+  }
+  async alarm(){await this.expire();await this.ctx.storage.setAlarm(Date.now()+60000);}
+  private async snapshot(id:string){
+    const row=this.read(id);
+    if(!row)return json({success:false,error:{code:'JOB_EXPIRED',message:'Job absent ou expiré.'}},404);
+    if(row.result){const result=await unseal<ExtractionResult>(row.result,this.env.DATA_KEY);return json({...result,requestId:id},result.success?200:result.error?.code==='ENT_AUTH_FAILED'||result.error?.code==='PRONOTE_AUTH_FAILED'?401:502);}
+    return json({version:VERSION,success:false,status:row.state,jobId:id,retryAfterSeconds:3},202,{'Retry-After':'3'});
+  }
+  private async claim(runner:string):Promise<Response>{
+    const row=[...this.ctx.storage.sql.exec<JobRow>("SELECT * FROM jobs WHERE state = 'queued' AND deadline > ? ORDER BY created LIMIT 1",Date.now())][0];
+    if(!row)return json({job:null});
+    const lease=randomToken();
+    // Clear ciphertext as soon as it is claimed. Interrupted jobs require caller resubmission.
+    this.ctx.storage.sql.exec("UPDATE jobs SET state = 'running', request = NULL, lease = ?, runner = ?, deadline = ? WHERE id = ?",lease,runner,Date.now()+180000,row.id);
+    try {const input=await unseal<Credentials>(row.request!,this.env.DATA_KEY);return json({job:{id:row.id,lease,input}});}
+    catch{this.ctx.storage.sql.exec('DELETE FROM jobs WHERE id = ?',row.id);return json({error:{code:'JOB_DECRYPTION_FAILED'}},500);}
+  }
+  async fetch(request:Request):Promise<Response>{
+    try{
+      const url=new URL(request.url);const path=url.pathname;
+      if(path==='/health')return json(await this.health());
+      if(path==='/submit'){
+        const input=validateCredentials(await body(request));
+        const ip=request.headers.get('x-client-ip')||'unknown';const hashed=await digest(ip);
+        const row=[...this.ctx.storage.sql.exec<{count:number;until:number}>('SELECT count, until FROM limits WHERE key = ?',hashed)][0];
+        const now=Date.now();const n=row&&row.until>now?row.count+1:1;const until=row&&row.until>now?row.until:now+60000;
+        this.ctx.storage.sql.exec('INSERT INTO limits VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET count = excluded.count, until = excluded.until',hashed,n,until);
+        if(n>5)return json({success:false,error:{code:'RATE_LIMITED',message:'Cinq extractions par minute et par IP maximum.'}},429,{'Retry-After':String(Math.ceil((until-now)/1000))});
+        const pending=[...this.ctx.storage.sql.exec<{n:number}>("SELECT COUNT(*) AS n FROM jobs WHERE state IN ('queued','running')")][0].n;
+        if(pending>=12)return json({success:false,error:{code:'QUEUE_FULL',message:'Le moteur est occupé. Réessayez plus tard.'}},503,{'Retry-After':'30'});
+        const id=crypto.randomUUID(),jobToken=randomToken();const ownerHash=await digest(jobToken);const encrypted=await seal(input,this.env.DATA_KEY);
+        this.ctx.storage.sql.exec('INSERT INTO jobs (id,ownerHash,state,request,created,deadline) VALUES (?,?,?,?,?,?)',id,ownerHash,'queued',encrypted,now,now+180000);
+        this.wakeClaim?.();
+        const h=await this.health();
+        if(!h.runnerOnline&&!await this.dispatch('request')){this.ctx.storage.sql.exec('DELETE FROM jobs WHERE id = ?',id);return json({success:false,error:{code:'RUNNER_START_FAILED',message:'Le lancement du moteur a échoué.'}},503);}
+        const immediate=this.read(id);
+        if(immediate&&!immediate.result)await new Promise<void>(resolve=>{const timer=setTimeout(finish,22000);const self=this;function finish(){clearTimeout(timer);self.waiters.delete(id);resolve();}this.waiters.set(id,finish);});
+        const response=await this.snapshot(id);
+        const out=await response.json<Record<string,unknown>>();
+        return json({...out,jobId:id,jobToken,statusUrl:`/api/v1/job/${id}`},response.status,{'X-Job-Token':jobToken,'Retry-After':'3'});
+      }
+      if(path.startsWith('/job/')){
+        const id=path.slice(5);await this.expire();const row=this.read(id);const token=request.headers.get('x-job-token')||'';
+        if(!row||!token||!await equalSecret(await digest(token),row.ownerHash))return json({success:false,error:{code:'JOB_NOT_FOUND',message:'Job absent ou jeton de lecture invalide.'}},404);
+        if(request.method==='DELETE'){this.ctx.storage.sql.exec('DELETE FROM jobs WHERE id = ?',id);this.waiters.get(id)?.();return json({deleted:true});}
+        return this.snapshot(id);
+      }
+      if(path==='/heartbeat'){
+        const info=await body(request) as {id?:string;draining?:boolean;revision?:string};
+        if(typeof info.id!=='string'||info.id.length>100)return json({error:{code:'INVALID_RUNNER'}},400);
+        await this.ctx.storage.put('runner',{id:info.id,draining:!!info.draining,revision:typeof info.revision==='string'?info.revision.slice(0,64):'unknown',until:Date.now()+65000});return json({ok:true});
+      }
+      if(path==='/claim'){
+        const info=await body(request) as {id?:string};if(typeof info.id!=='string')return json({error:{code:'INVALID_RUNNER'}},400);
+        const initial=await this.claim(info.id);const parsed=await initial.clone().json<{job:unknown}>();if(parsed.job)return initial;
+        await new Promise<void>(resolve=>{const timer=setTimeout(finish,20000);const self=this;function finish(){clearTimeout(timer);if(self.wakeClaim===finish)self.wakeClaim=undefined;resolve();}this.wakeClaim=finish;});
+        return this.claim(info.id);
+      }
+      if(path==='/result'){
+        const info=await body(request,2_000_000) as {id:string;lease:string;result:ExtractionResult};const row=this.read(info.id);
+        if(!row||row.state!=='running'||row.lease!==info.lease)return json({error:{code:'INVALID_LEASE'}},409);
+        if(!info.result||info.result.version!==VERSION||typeof info.result.success!=='boolean'||!Array.isArray(info.result.modules))return json({error:{code:'INVALID_RESULT'}},400);
+        assertNoCredentials(info.result);
+        const packed=await seal(info.result,this.env.DATA_KEY);
+        this.ctx.storage.sql.exec('UPDATE jobs SET state = ?, result = ?, lease = NULL, deadline = ? WHERE id = ?',info.result.success?'done':'error',packed,Date.now()+300000,info.id);
+        await this.ctx.storage.put('lastExtraction',summarize(info.result));this.waiters.get(info.id)?.();return json({ok:true});
+      }
+      if(path==='/relay')return json({ok:await this.dispatch('rotation')});
+      return json({error:{code:'NOT_FOUND'}},404);
+    }catch(error){return json(safeFailure(error),error instanceof ApiError?error.status:500);}
+  }
+}
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
-    const cors = corsHeaders(request, env);
-
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          ...cors,
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key',
-          'Access-Control-Max-Age': '86400',
-        },
-      });
-    }
-
-    try {
-      // --- Stub du Durable Object : instance unique, donc sérialisation
-      //     naturelle de toutes les opérations d'état.
-      const id = env.JOB_STORE.idFromName('pronote-global');
-      const doFetch = (path: string, init?: RequestInit) => {
-        const stub = env.JOB_STORE.get(id);
-        return stub.fetch(`https://jobstore.internal${path}`, init);
-      };
-
-      // =====================================================================
-      // SANTÉ
-      // =====================================================================
-      if (url.pathname === '/api/v1/health' || url.pathname === '/api/health' || url.pathname === '/health') {
-        const res = await doFetch('/health');
-        const h = await res.json<Record<string, unknown>>();
-        return json({
-          status: 'ok',
-          version: SCHEMA_VERSION,
-          architecture: 'Worker + Durable Object (cohérence forte) + runner GitHub Actions',
-          storage: 'Durable Object SQLite (KV supprimé)',
-          runnerOnline: h.runnerOnline,
-          runnerId: h.runnerId,
-          queueDepth: h.queueDepth,
-          // Compteur persistant permettant une mesure avant/après du coût DO
-          // réel d'une extraction (objectif observé : 5 à 6 requêtes).
-          requetesDO: h.requetesDO,
-          timestamp: new Date().toISOString(),
-        }, 200, cors);
+  async fetch(request:Request,env:Env):Promise<Response>{
+    const url=new URL(request.url);
+    const origin=request.headers.get('origin');const origins=(env.ALLOWED_ORIGINS||'').split(',').filter(Boolean);
+    const cors:Record<string,string>={};if(origin&&(origin===url.origin||origins.includes(origin)))cors['Access-Control-Allow-Origin']=origin;
+    cors['Vary']='Origin';
+    const reply=(r:Response)=>{const h=new Headers(r.headers);for(const[k,v]of Object.entries(cors))h.set(k,v);return new Response(r.body,{status:r.status,headers:h});};
+    try{
+      if(request.method==='OPTIONS')return reply(new Response(null,{status:204,headers:{'Access-Control-Allow-Methods':'GET,POST,DELETE,OPTIONS','Access-Control-Allow-Headers':'Content-Type,Authorization,X-API-Key,X-Job-Token','Access-Control-Expose-Headers':'X-Job-Token,Retry-After'}}));
+      if(request.method==='GET'&&['/','/docs'].includes(url.pathname))return new Response(documentation,{headers:{'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",'X-Content-Type-Options':'nosniff'}});
+      const stub=env.COORDINATOR.get(env.COORDINATOR.idFromName('pronote-v5'));
+      if(['/api/v1/health','/api/health','/health','/api/v1/ready'].includes(url.pathname)){
+        const r=await stub.fetch('https://internal/health');if(url.pathname.endsWith('/ready')){const h=await r.json<{runnerOnline:boolean}>();return reply(json(h,h.runnerOnline?200:503));}return reply(r);
       }
-
-      // =====================================================================
-      // SCHÉMA PUBLIC (JSON) — généré depuis la source unique de vérité
-      // =====================================================================
-      if (url.pathname === '/api/v1/schema' || url.pathname === '/api/schema') {
-        return json({
-          version: SCHEMA_VERSION,
-          baseUrl: `${url.origin}/api/v1`,
-          fields: FIELDS,
-          errors: ERROR_CATALOG,
-        }, 200, { ...cors, 'Cache-Control': 'public, max-age=300' });
+      if(url.pathname==='/api/v1/schema')return reply(json({version:VERSION,authentication:'Identifiants ENT fournis par le client ; API_KEYS optionnel',modules:['emploiDuTemps','notes','agenda','ressources','vieScolaire','competences','actualites','cantine'],jobAccess:'X-Job-Token obligatoire pour GET et DELETE /api/v1/job/:id',retention:{credentials:'effacés à la prise en charge',resultsSeconds:300},scope:'ENT77, espace élève, vues actuellement sélectionnées ; null signifie non exposé, indisponible n’est pas vide.'}));
+      if(url.pathname.startsWith('/internal/')){
+        if(request.method!=='POST'||!env.RUNNER_TOKEN||!await equalSecret(bearer(request),env.RUNNER_TOKEN)||request.headers.get('x-runner-version')!==VERSION)return reply(json({error:{code:'UNAUTHORIZED'}},401));
+        const action=url.pathname.slice('/internal'.length);if(!['/heartbeat','/claim','/result','/relay'].includes(action))return reply(json({error:{code:'NOT_FOUND'}},404));
+        return reply(await stub.fetch(new Request(`https://internal${action}`,request)));
       }
-
-      // =====================================================================
-      // RUNNER — tous les endpoints sont AUTHENTIFIÉS
-      // =====================================================================
-
-      if (url.pathname.startsWith('/api/v1/runner/') || url.pathname.startsWith('/api/runner/')) {
-        const authed = await requireRunnerAuth(request, env);
-        if (!authed) {
-          return json({ success: false, errorCode: 'UNAUTHORIZED', error: 'Token runner invalide ou absent.' }, 401, cors);
-        }
-        // Coupe immédiatement les sessions lancées avec l'ancien workflow.
-        // Elles partagent potentiellement encore le même token, mais ne
-        // connaissent pas ce protocole et ne doivent plus réclamer de jobs v4.
-        if (request.headers.get('x-runner-protocol') !== '6') {
-          return json({ success: false, errorCode: 'UNAUTHORIZED', error: 'Protocole runner obsolète.' }, 426, cors);
-        }
-
-        if (url.pathname.endsWith('/heartbeat')) {
-          const body = await request.json<{ runnerId: string; status?: string; logs?: string[] }>().catch(() => null);
-          if (!body) return json({ success: false, errorCode: 'INVALID_REQUEST', error: 'JSON invalide.' }, 400, cors);
-          await doFetch('/heartbeat', {
-            method: 'POST',
-            body: JSON.stringify({ ...body, protocolVersion: 6, logs: (body.logs || []).slice(-20) }),
-          });
-          return json({ success: true, acknowledgedAt: Date.now() }, 200, cors);
-        }
-
-        if (url.pathname.endsWith('/next-job')) {
-          const body = await request.json<{ runnerId: string }>().catch(() => ({ runnerId: 'unknown' }));
-          const res = await doFetch('/claim', { method: 'POST', body: JSON.stringify(body) });
-          const data = await res.json<Record<string, unknown>>();
-          // Aucun identifiant, même masqué ou haché, n'est journalisé.
-          if (data.hasJob) {
-            const job = data.job as { jobId: string };
-            console.log(`[runner] job ${job.jobId} remis au runner.`);
-          }
-          return json(data, 200, cors);
-        }
-
-        if (url.pathname.endsWith('/job-result')) {
-          const body = await request.json<{ jobId: string; payload: string; success: boolean; errorCode?: string }>().catch(() => null);
-          if (!body || !body.jobId) {
-            return json({ success: false, errorCode: 'INVALID_REQUEST', error: 'jobId manquant.' }, 400, cors);
-          }
-          const res = await doFetch('/result', {
-            method: 'POST',
-            body: JSON.stringify({
-              jobId: body.jobId,
-              success: body.success === true,
-              payload: body.payload,
-              errorCode: body.errorCode,
-            }),
-          });
-          const data = await res.json<Record<string, unknown>>();
-          // Diagnostic ASSAINI uniquement (ni mot de passe, ni note d'élève).
-          if (env.GITHUB_FALLBACK_ISSUE) {
-            ctx.waitUntil(postDiagnostic(env, {
-              jobId: body.jobId,
-              event: body.success ? 'extraction réussie' : 'extraction en échec',
-              errorCode: body.errorCode,
-            }));
-          }
-          return json(data, 200, cors);
-        }
-
-        /**
-         * Relais de session : le runner arrivant en fin de vie demande son
-         * remplaçant. Un SEUL point de déclenchement (l'ancien code appelait
-         * deux API GitHub en parallèle, créant deux runs qui s'annulaient, et
-         * le workflow en ajoutait un troisième via `curl`).
-         */
-        if (url.pathname.endsWith('/relay')) {
-          const ok = await dispatchRunner(env, 'session_rotation');
-          return json({ success: ok, dispatched: ok }, ok ? 200 : 502, cors);
-        }
-
-        return json({ success: false, errorCode: 'INVALID_REQUEST', error: 'Endpoint runner inconnu.' }, 404, cors);
+      const keys=(env.API_KEYS||'').split(',').filter(Boolean);
+      if(keys.length&&!(await Promise.all(keys.map(k=>equalSecret(bearer(request),k)))).some(Boolean))return reply(json({error:{code:'UNAUTHORIZED',message:'Clé API requise.'}},401));
+      if(['/api/v1/scrape-pronote','/api/v1/scrape','/api/scrape-pronote','/api/scrape'].includes(url.pathname)){
+        if(request.method!=='POST')return reply(json({error:{code:'METHOD_NOT_ALLOWED'}},405));
+        if(!env.DATA_KEY)return reply(json({error:{code:'NOT_CONFIGURED'}},503));
+        const h=new Headers(request.headers);h.set('x-client-ip',request.headers.get('cf-connecting-ip')||'unknown');
+        return reply(await stub.fetch(new Request('https://internal/submit',{method:'POST',headers:h,body:request.body})));
       }
-
-      // =====================================================================
-      // CONSULTATION D'UN JOB
-      // =====================================================================
-      if (url.pathname.startsWith('/api/v1/job/') || url.pathname.startsWith('/api/job/')) {
-        const jobId = url.pathname.split('/').pop() || '';
-        if (!/^[A-Za-z0-9_-]{8,100}$/.test(jobId)) {
-          return json({ success: false, errorCode: 'INVALID_REQUEST', error: 'jobId invalide.' }, 400, cors);
-        }
-
-        const res = await doFetch(`/result?jobId=${encodeURIComponent(jobId)}`);
-        const data = await res.json<{ status: string; result: string | null; errorCode: string | null }>();
-
-        if (data.status === 'expired') {
-          return json({ jobId, success: false, status: 'expired', errorCode: 'TIMEOUT', error: 'Job inconnu ou expiré.' }, 404, cors);
-        }
-
-        if ((data.status === 'done' || data.status === 'error') && data.result) {
-          return new Response(data.result, {
-            status: data.status === 'done' ? 200 : 502,
-            headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...cors },
-          });
-        }
-
-        return json({
-          jobId,
-          success: false,
-          status: data.status,
-          error: 'Extraction en cours.',
-        }, 202, { ...cors, 'Retry-After': '2' });
-      }
-
-      // =====================================================================
-      // ENDPOINT PRINCIPAL
-      // =====================================================================
-      const isScrapeRoute =
-        url.pathname === '/api/v1/scrape-pronote' ||
-        url.pathname === '/api/v1/scrape' ||
-        url.pathname === '/api/scrape-pronote' ||
-        url.pathname === '/api/scrape' ||
-        url.pathname === '/api/v1/scrape-pronote/html' ||
-        url.pathname === '/api/scrape-pronote/html' ||
-        url.pathname === '/html' ||
-        url.pathname === '/html/';
-
-      if (isScrapeRoute) {
-        if (request.method !== 'POST') {
-          return json({ success: false, errorCode: 'INVALID_REQUEST', error: 'Utilisez POST.' }, 405, cors);
-        }
-
-        // --- Authentification client (optionnelle mais recommandée) ---
-        const apiAuth = await requireApiKey(request, env);
-        if (!apiAuth.ok) {
-          return json({ success: false, errorCode: apiAuth.code, error: apiAuth.error }, apiAuth.status, cors);
-        }
-
-        // --- Limitation de débit ---
-        const ip = request.headers.get('cf-connecting-ip') || 'unknown';
-        const rlRes = await doFetch('/ratelimit', { method: 'POST', body: JSON.stringify({ key: ip }) });
-        const rl = await rlRes.json<{ allowed: boolean; remaining: number; resetAt: number }>();
-        if (!rl.allowed) {
-          const retryAfter = Math.max(1, Math.ceil((rl.resetAt - Date.now()) / 1000));
-          return json({
-            success: false, errorCode: 'RATE_LIMITED',
-            error: `Trop de requêtes. Réessayez dans ${retryAfter} seconde(s).`,
-          }, 429, {
-            ...cors,
-            'Retry-After': String(retryAfter),
-            'X-RateLimit-Remaining': '0',
-            'X-RateLimit-Reset': String(rl.resetAt),
-          });
-        }
-
-        // --- Validation stricte (dont protection SSRF) ---
-        const rawBody = await request.json<unknown>().catch(() => {
-          return { __parseError: true };
-        });
-        if (rawBody && typeof rawBody === 'object' && '__parseError' in rawBody) {
-          return json({ success: false, errorCode: 'INVALID_REQUEST', error: 'Corps JSON malformé.' }, 400, cors);
-        }
-
-        const validated = validateScrapeBody(rawBody, env);
-        if (!validated.ok) {
-          return json({ success: false, errorCode: 'INVALID_REQUEST', error: validated.error }, 400, cors);
-        }
-
-        const { username, password, format, noCache } = validated.value;
-        const pronoteUrl = validated.value.pronoteUrl
-          || env.DEFAULT_PRONOTE_URL
-          || 'https://0771068t.index-education.net/pronote/eleve.html';
-        const entUrl = validated.value.entUrl
-          || env.DEFAULT_ENT_URL
-          || 'https://ent.seine-et-marne.fr/';
-
-        const jobId = crypto.randomUUID();
-        const t0 = Date.now();
-
-        await doFetch('/job', {
-          method: 'POST',
-          body: JSON.stringify({ jobId, username, password, pronoteUrl, entUrl, format }),
-        });
-
-        // --- Démarrage du runner si nécessaire (une seule fois) ---
-        const healthRes = await doFetch('/health');
-        const health = await healthRes.json<{ runnerOnline: boolean }>();
-        if (!health.runnerOnline) {
-          ctx.waitUntil(dispatchRunner(env, 'session_startup'));
-        }
-
-        // --- Attente synchrone bornée, SANS SCRUTATION ---
-        // Une seule requête POST /wait reste ouverte dans le Durable Object.
-        // POST /result la réveille dès l'écriture SQLite. L'ancienne boucle à
-        // 200 ms coûtait jusqu'à 128 requêtes DO par extraction, limitant le
-        // service à ~781 extractions/jour malgré le quota de 100 000 requêtes.
-        const configuredBudget = Number(env.SYNC_WAIT_MS ?? DEFAULT_SYNC_WAIT_MS);
-        const budget = Math.max(
-          1_000,
-          Math.min(30_000, Number.isFinite(configuredBudget) ? configuredBudget : DEFAULT_SYNC_WAIT_MS),
-        );
-        if (noCache) { /* réservé : le cache n'est pas encore activé */ }
-
-        const waitRes = await doFetch('/wait', {
-          method: 'POST',
-          body: JSON.stringify({ jobId, timeoutMs: budget }),
-        });
-        const waited = await waitRes.json<{ status: string; result: string | null }>();
-
-        if ((waited.status === 'done' || waited.status === 'error') && waited.result) {
-          const headers: Record<string, string> = {
-            ...cors,
-            'X-Job-Id': jobId,
-            'X-RateLimit-Remaining': String(rl.remaining),
-            'X-Execution-Time-Ms': String(Date.now() - t0),
-          };
-          if (format === 'html') headers['X-Format'] = 'html';
-          return new Response(waited.result, {
-            status: waited.status === 'done' ? 200 : 502,
-            headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers },
-          });
-        }
-
-        // --- Pas de résultat dans le budget : 202 + jobId EXPLOITABLE ---
-        // L'ancien code renvoyait un 504 sans aucun identifiant, rendant le
-        // mode différé documenté totalement inutilisable.
-        return json({
-          jobId,
-          success: false,
-          status: 'running',
-          errorCode: 'TIMEOUT',
-          error: `L'extraction n'a pas abouti en ${Math.round(budget / 1000)} s. Le job ${jobId} continue en tâche de fond : interrogez GET /api/v1/job/${jobId} pour récupérer le résultat.`,
-          statusUrl: `${url.origin}/api/v1/job/${jobId}`,
-          retryAfterSeconds: 3,
-        }, 202, { ...cors, 'Retry-After': '3', 'X-Job-Id': jobId });
-      }
-
-      // =====================================================================
-      // DOCUMENTATION
-      // =====================================================================
-      const accept = (request.headers.get('accept') || '').toLowerCase();
-      const wantsJson = accept.includes('application/json') && !accept.includes('text/html');
-      const isDocPath =
-        url.pathname === '/' || url.pathname === '/docs' || url.pathname === '/docs/' ||
-        url.pathname === '/playground' || url.pathname === '/index.html';
-
-      if (isDocPath && !wantsJson) {
-        return new Response(renderDocs(url.origin), {
-          headers: {
-            'Content-Type': 'text/html; charset=utf-8',
-            'Cache-Control': 'public, max-age=300',
-            ...cors,
-          },
-        });
-      }
-
-      // Index JSON par défaut de l'API
-      return json({
-        service: 'Pronote API Gateway',
-        version: SCHEMA_VERSION,
-        architecture: 'Worker + Durable Object + Runner GitHub Actions',
-        endpoints: {
-          health: 'GET /api/v1/health',
-          scrape: 'POST /api/v1/scrape-pronote',
-          job: 'GET /api/v1/job/:jobId',
-          schema: 'GET /api/v1/schema',
-          docs: 'GET /docs',
-        },
-        errors: ERROR_CATALOG,
-        sample: EXAMPLE.response,
-      }, 200, cors);
-
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Erreur interne inconnue';
-      console.error(`[worker] ${message}`);
-      return json({
-        success: false,
-        errorCode: 'INTERNAL_ERROR',
-        error: message,
-      }, 500, cors);
-    }
+      const match=/^\/api\/(?:v1\/)?job\/([a-f0-9-]{36})$/.exec(url.pathname);
+      if(match&&['GET','DELETE'].includes(request.method))return reply(await stub.fetch(new Request(`https://internal/job/${match[1]}`,request)));
+      return reply(json({error:{code:'NOT_FOUND',message:'Consultez /docs.'}},404));
+    }catch(error){return reply(json(safeFailure(error),error instanceof ApiError?error.status:500));}
   },
 } satisfies ExportedHandler<Env>;
-
-// ---------------------------------------------------------------------------
-// Authentification
-// ---------------------------------------------------------------------------
-
-/**
- * Authentifie le runner. Sans `RUNNER_TOKEN` configuré, on REFUSE par défaut
- * (fail-closed) : l'ancienne version laissait ces endpoints totalement
- * ouverts, exposant les mots de passe ENT à quiconque appelait
- * `/api/runner/poll-job`.
- */
-async function requireRunnerAuth(request: Request, env: Env): Promise<boolean> {
-  const expected = env.RUNNER_TOKEN;
-  if (!expected) {
-    console.error('[auth] RUNNER_TOKEN non configuré : endpoints runner refusés (fail-closed).');
-    return false;
-  }
-  const provided = extractBearer(request);
-  if (!provided) return false;
-  return safeEqual(provided, expected);
-}
-
-/** Authentifie le client si `API_KEYS` est configuré (liste séparée par des virgules). */
-async function requireApiKey(
-  request: Request,
-  env: Env,
-): Promise<{ ok: true } | { ok: false; status: number; code: ErrorCode; error: string }> {
-  const configured = (env.API_KEYS || '').split(',').map((s) => s.trim()).filter(Boolean);
-  if (configured.length === 0) return { ok: true }; // non configuré = accès libre (voir README)
-
-  const provided = extractBearer(request);
-  if (!provided) {
-    return { ok: false, status: 401, code: 'UNAUTHORIZED', error: 'Clé d\'API manquante (en-tête Authorization: Bearer … ou X-API-Key).' };
-  }
-  for (const key of configured) {
-    if (await safeEqual(provided, key)) return { ok: true };
-  }
-  return { ok: false, status: 401, code: 'UNAUTHORIZED', error: 'Clé d\'API invalide.' };
-}
-
-export { cleanText };

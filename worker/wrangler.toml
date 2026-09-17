@@ -1,0 +1,33 @@
+name = "pronote-api"
+main = "index.ts"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+preview_urls = false
+send_metrics = false
+tsconfig = "tsconfig.json"
+
+[vars]
+GITHUB_OWNER = "JeanHug"
+GITHUB_REPO = "Pronote-API"
+ALLOWED_ORIGINS = ""
+
+[[durable_objects.bindings]]
+name = "COORDINATOR"
+class_name = "Coordinator"
+
+[[migrations]]
+tag = "v1-add-jobstore"
+new_sqlite_classes = ["JobStore"]
+
+[[migrations]]
+tag = "v5-rebuild"
+deleted_classes = ["JobStore"]
+new_sqlite_classes = ["Coordinator"]
+
+[triggers]
+crons = []
+
+[observability]
+enabled = true
+head_sampling_rate = 0.1

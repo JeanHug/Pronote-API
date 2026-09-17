@@ -1,0 +1,65 @@
+name: Verify, deploy and test v5
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: pronote-v5-release
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/app_db
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx next typegen
+      - run: npx tsc --noEmit
+      - run: npx tsc --noEmit -p worker/tsconfig.json
+      - run: npx tsx --test tests/core.test.ts
+      - run: npm run build
+      - name: Bundle the Worker without deployment
+        working-directory: worker
+        run: npx wrangler deploy --dry-run
+  deploy-and-live-test:
+    needs: verify
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+      WORKER_URL: https://pronote-api.hugdu77777.workers.dev
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Deploy only after all checks pass
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ID }}
+        run: npx wrangler deploy
+      - name: Start the matching runner revision
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: node scripts/start-runner.mjs
+      - name: Real API verification, no personal data output
+        env:
+          ENT_ID: ${{ secrets.ENT_ID }}
+          ENT_PASS: ${{ secrets.ENT_PASS }}
+          API_KEY: ${{ secrets.API_KEY }}
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: npx tsx scripts/test-api.ts

@@ -1,20 +1,15 @@
 node_modules/
-dist/
-_site/
-coverage/
-.DS_Store
-*.log
+.next/
+.wrangler/
+**/.wrangler/
 .env
 .env.*
 !.env.example
-.wrangler/
-.dev.vars
-.venv/
-
-# Rapports de test live : ils peuvent contenir des données d'élève.
-# Ne doivent JAMAIS être commités.
+.dev.vars*
+*.log
+*.tsbuildinfo
+reports/
 rapports/
-*.rapport.json
-
-# Documentation générée (produite par scripts/build-docs.ts)
-docs/index.html
+screenshots/
+playwright-report/
+test-results/
