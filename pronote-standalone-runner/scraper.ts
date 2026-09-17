@@ -28,6 +28,19 @@
  *
  *  6. PAYLOAD — le HTML complet de la session n'est plus concaténé ni envoyé
  *     deux fois (`html` + `rawHtml`). En mode JSON il n'est pas transmis du tout.
+ *
+ *  7. FORMULAIRES — la saisie passe par le setter natif de
+ *     `HTMLInputElement.prototype` avant l'événement `input`, ce qui la rend
+ *     correcte aussi bien pour Alpine (x-model), Vue (v-model) que React
+ *     (input contrôlé). Après le clic d'onglet de l'ENT, le formulaire est
+ *     attendu (champ visible) au lieu d'un `setTimeout(250)` fixe, et un repli
+ *     clique le bouton de validation du conteneur quand le fournisseur n'a pas
+ *     de `<form>` (handler onClick seul).
+ *
+ *  8. ONGLETS — ouverture, navigation et capture sont SÉQUENTIELLES : en
+ *     parallèle, l'application AngularJS de Pronote met en file d'attente les
+ *     requêtes simultanées d'une même session et des onglets capturaient la
+ *     page d'attente au lieu du contenu.
  */
 
 import puppeteer, { Browser, BrowserContext, Page } from 'puppeteer';
@@ -193,14 +206,37 @@ async function loginENT(page: Page, username: string, password: string, log: (s:
   }, false);
   if (tabClicked) log('Onglet « Personnel collectivité » sélectionné.');
 
-  await new Promise((r) => setTimeout(r, 250)); // laisse Alpine monter le formulaire
+  // Attente fiable du formulaire APRÈS sélection de l'onglet : le cadre
+  // change de contenu (Alpine démonte/remonte les champs via x-if/x-show).
+  // Le sommeil fixe de 250 ms d'avant faisait saisir les identifiants dans un
+  // nœud pas encore monté quand le framework était plus lent. On attend un
+  // champ de mot de passe réellement visible, avec repli borné, puis une
+  // courte stabilisation pour laisser les liaisons x-model se terminer.
+  const formReady = await page
+    .waitForSelector('input[name="password"], input[type="password"]', { timeout: 8_000, visible: true })
+    .then(() => true)
+    .catch(() => false);
+  log(formReady
+    ? 'Formulaire prêt après sélection de l’onglet.'
+    : 'Champ de mot de passe non confirmé sous 8 s (repli borné : poursuite).');
+  await new Promise((r) => setTimeout(r, 120));
 
   // 3. Saisie des identifiants + soumission
   const filled = await page.evaluate((u: string, p: string) => {
+    // Saisie compatible Alpine / Vue / React :
+    //  - Alpine (x-model) et Vue (v-model) réagissent à l'événement « input » ;
+    //  - React verrouille la valeur via un descripteur installé sur l'instance :
+    //    `el.value = v` est écrasé et l'état du composant reste vide. Il faut
+    //    appeler le SETTER NATIF de HTMLInputElement.prototype, puis émettre
+    //    « input » pour que le framework voie le changement.
+    // Le setter natif est aussi correct pour Alpine et Vue : aucun risque de
+    // double écriture, les événements partent bien de l'élément.
     const setVal = (el: HTMLInputElement | null, v: string) => {
       if (!el) return false;
       el.focus();
-      el.value = v;
+      const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      if (nativeSetter) nativeSetter.call(el, v);
+      else el.value = v;
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
       return true;
@@ -219,6 +255,24 @@ async function loginENT(page: Page, username: string, password: string, log: (s:
       if (submit) submit.click();
       else form.requestSubmit();
       return true;
+    }
+    // Repli pour les ENT dont le bouton est un handler onClick React/Vue sans
+    // <form> : les champs existent mais aucun formulaire ne les enveloppe.
+    // On clique alors le bouton de validation trouvé dans le conteneur des
+    // champs — jamais un bouton quelconque de la page.
+    if (okE && okP) {
+      const scope = (email || pass) as HTMLElement;
+      const box = (scope.closest('[role="dialog"], .modal, .modal-content, [id*="login" i], .login, form') || document.body) as HTMLElement;
+      const buttons = Array.from(box.querySelectorAll('button, [role="button"], input[type="submit"]')) as HTMLElement[];
+      const target = buttons.find((b) => {
+        const txt = ((b as HTMLButtonElement).innerText || b.textContent || b.getAttribute('value') || '').trim().toLowerCase();
+        return b.getAttribute('type') === 'submit'
+          || /se connecter|connexion|valider|soumettre/.test(txt);
+      });
+      if (target) {
+        target.click();
+        return true;
+      }
     }
     return false;
   }, username, password).catch(() => false);
@@ -368,6 +422,13 @@ const TABS: TabSpec[] = [
  *
  * Les pages partagent le contexte de navigateur, donc la session Pronote est
  * commune : inutile de se réauthentifier pour chaque onglet.
+ *
+ * La séquence ouverture → navigation → capture est SÉQUENTIELLE. La version
+ * parallèle déclenchait des courses entre onglets : l'application AngularJS
+ * de Pronote met en file d'attente les requêtes simultanées d'une même
+ * session, et plusieurs pages capturaient alors une page d'attente ou un DOM
+ * partiel. Un seul onglet sollicite le serveur à la fois ; le temps total
+ * augmente légèrement, mais chaque DOM est complet.
  */
 async function captureTabs(
   context: BrowserContext,
@@ -378,35 +439,26 @@ async function captureTabs(
   const pages: PagesHTML = {};
   const t0 = Date.now();
 
-  const targets = await Promise.all(
-    TABS.map(async (tab) => {
-      // Même BrowserContext que la page authentifiée : les cookies ENT/Pronote
-      // sont partagés. `browser.newPage()` ouvrirait le contexte par défaut et
-      // perdrait silencieusement la session SSO.
-      const p = await context.newPage();
-      await p.setUserAgent(UA);
-      await p.evaluateOnNewDocument(() => {
+  for (const tab of TABS) {
+    const t = Date.now();
+    // Même BrowserContext que la page authentifiée : les cookies ENT/Pronote
+    // sont partagés. `browser.newPage()` ouvrirait le contexte par défaut et
+    // perdrait silencieusement la session SSO.
+    const page = await context.newPage();
+    try {
+      await page.setUserAgent(UA);
+      await page.evaluateOnNewDocument(() => {
         (window as any).__name = (fn: unknown) => fn;
         (globalThis as any).__name = (fn: unknown) => fn;
       });
-      await gotoWithRetry(p, pronoteUrl, 2, log);
-      return { tab, page: p };
-    }),
-  );
+      await gotoWithRetry(page, pronoteUrl, 2, log);
 
-  // Attente conditionnelle de l'interface, avec repli borné.
-  await Promise.all(targets.map(({ page }) =>
-    page.waitForFunction(
-      () => document.querySelectorAll('.label-menu_niveau0, .menu-principal_niveau0, .GInterface_Onglet, [role="tab"]').length > 0,
-      { timeout: 12_000 },
-    ).catch(() => null),
-  ));
-  timings.ouvertureOnglets = Date.now() - t0;
+      // Attente conditionnelle de l'interface, avec repli borné.
+      await page.waitForFunction(
+        () => document.querySelectorAll('.label-menu_niveau0, .menu-principal_niveau0, .GInterface_Onglet, [role="tab"]').length > 0,
+        { timeout: 12_000 },
+      ).catch(() => null);
 
-  // Navigation + capture, en parallèle sur toutes les pages.
-  await Promise.all(targets.map(async ({ tab, page }) => {
-    const t = Date.now();
-    try {
       await dismissModals(page);
       const res = await page.evaluate(
         `${NAVIGATE_FN}(${JSON.stringify(tab.parents)}, ${JSON.stringify(tab.sub)})`,
@@ -441,7 +493,8 @@ async function captureTabs(
       timings[tab.key] = Date.now() - t;
       await page.close().catch(() => null);
     }
-  }));
+  }
+  timings.ouvertureOnglets = Date.now() - t0;
 
   return pages;
 }
