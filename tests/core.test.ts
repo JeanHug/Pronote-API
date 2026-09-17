@@ -3,7 +3,14 @@ import assert from 'node:assert/strict';
 import { validateCredentials, assertNoCredentials, safeFailure, summarize, ApiError } from '../src/pronote/contracts';
 import { dateFromLabel, parseTimetable, parseGrades, parseAssignments, parseResources } from '../src/pronote/parsers';
 import { seal, unseal, randomToken, equalSecret } from '../worker/crypto';
+import { isConsoleOriginAllowed } from '../src/pronote/http';
 const input={username:'test-user',password:'not-a-real-password'};
+test('console origin works behind HTTPS proxy without accepting other sites',()=>{
+  assert.equal(isConsoleOriginAllowed(new Request('http://localhost:3000/api/pronote',{headers:{origin:'https://console.example.test',host:'localhost:3000','x-forwarded-host':'console.example.test'}})),true);
+  assert.equal(isConsoleOriginAllowed(new Request('http://localhost:3000/api/pronote',{headers:{origin:'http://127.0.0.1:3000',host:'127.0.0.1:3000'}})),true);
+  assert.equal(isConsoleOriginAllowed(new Request('http://localhost:3000/api/pronote',{headers:{origin:'https://evil.example.test','x-forwarded-host':'console.example.test'}})),false);
+  assert.equal(isConsoleOriginAllowed(new Request('http://localhost:3000/api/pronote',{headers:{origin:'null'}})),false);
+});
 test('validates ENT77 request and selects default modules',()=>{assert.equal(validateCredentials(input).modules.length,8);});
 test('rejects missing and malformed credentials',()=>{for(const value of [null,[],{},1,{...input,password:''},{...input,username:'x'.repeat(201)}])assert.throws(()=>validateCredentials(value));});
 test('rejects SSRF targets and session-bearing URLs',()=>{for(const pronoteUrl of ['http://school.index-education.net/pronote/eleve.html','https://127.0.0.1/pronote/eleve.html','https://school.index-education.net.evil.test/pronote/eleve.html','https://school.index-education.net/pronote/eleve.html?ticket=private','https://a:b@school.index-education.net/pronote/eleve.html','https://school.index-education.net:8443/pronote/eleve.html'])assert.throws(()=>validateCredentials({...input,pronoteUrl}));});

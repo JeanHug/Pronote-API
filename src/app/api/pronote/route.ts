@@ -1,9 +1,9 @@
 import { ApiError, safeFailure, validateCredentials } from '@/pronote/contracts';
+import { isConsoleOriginAllowed } from '@/pronote/http';
 export const dynamic='force-dynamic';
 export async function POST(request:Request){
   try{
-    const origin=request.headers.get('origin');
-    if(origin&&origin!==new URL(request.url).origin)return Response.json({error:{code:'FORBIDDEN_ORIGIN'}},{status:403});
+    if(!isConsoleOriginAllowed(request))return Response.json({error:{code:'FORBIDDEN_ORIGIN'}},{status:403});
     const raw=await request.text();if(raw.length>8192)throw new ApiError('BODY_TOO_LARGE',413,'validation','Requête trop volumineuse.');
     let decoded:unknown;try{decoded=JSON.parse(raw);}catch{throw new ApiError('INVALID_JSON',400,'validation','JSON invalide.');}
     const input=validateCredentials(decoded);
