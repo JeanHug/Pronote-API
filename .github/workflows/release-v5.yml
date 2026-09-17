@@ -17,7 +17,7 @@ jobs:
       PUPPETEER_SKIP_DOWNLOAD: 'true'
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/app_db
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -40,7 +40,7 @@ jobs:
       PUPPETEER_SKIP_DOWNLOAD: 'true'
       WORKER_URL: https://pronote-api.hugdu77777.workers.dev
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v5
         with:
           node-version: 22
