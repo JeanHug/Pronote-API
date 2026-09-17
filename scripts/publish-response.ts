@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { assertNoCredentialKeys } from '../src/pronote/credentials.ts';
 
 /**
  * Publie une réponse API autorisée en commentaires GitHub, sans jamais écrire
@@ -68,23 +69,11 @@ for (const comment of old) {
 const source = readFileSync(file, 'utf8');
 
 // Barrière anti-récidive : même avec publication complète autorisée, un objet
-// portant une clé d'identification ENT ne doit jamais quitter le workflow.
-const forbiddenKeys = new Set(['username', 'password', 'ent_id', 'ent_pass', 'entid', 'entpass']);
-function assertNoCredentials(value: unknown): void {
-  if (Array.isArray(value)) {
-    for (const item of value) assertNoCredentials(item);
-    return;
-  }
-  if (!value || typeof value !== 'object') return;
-  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-    if (forbiddenKeys.has(key.toLowerCase())) {
-      throw new Error(`Publication annulée : clé d’identification interdite détectée (${key}).`);
-    }
-    assertNoCredentials(nested);
-  }
-}
+// portant une clé d'identification ENT (username, password, pass, ent_id,
+// ent_pass…) ne doit jamais quitter le workflow. La logique vit dans
+// src/pronote/credentials.ts pour être testée au même titre que le reste.
 try {
-  assertNoCredentials(JSON.parse(source) as unknown);
+  assertNoCredentialKeys(JSON.parse(source) as unknown);
 } catch (error) {
   if (error instanceof SyntaxError) throw new Error('Publication annulée : le rapport n’est pas un JSON valide.');
   throw error;
