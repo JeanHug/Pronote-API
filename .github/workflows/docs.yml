@@ -1,0 +1,42 @@
+name: Public documentation v5
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'worker/docs.ts'
+      - 'src/pronote/contracts.ts'
+      - 'scripts/build-docs.ts'
+      - '.github/workflows/docs.yml'
+      - 'README.md'
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pronote-public-docs
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: 'true'
+      - name: Generate the static documentation from the same source as /docs
+        run: npx tsx scripts/build-docs.ts
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs
+      - id: deployment
+        uses: actions/deploy-pages@v4
