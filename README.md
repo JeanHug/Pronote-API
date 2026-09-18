@@ -46,7 +46,7 @@ Modules: `emploiDuTemps`, `notes`, `agenda`, `ressources`, `vieScolaire`, `compe
 - Results have a five-minute deadline, encrypted at rest and protected by a separate 256-bit capability. Cleanup is periodic; use DELETE for immediate erasure.
 - `RUNNER_TOKEN` is independent from the GitHub PAT. Runner requests require v5 protocol and successful results require a valid job lease.
 - Only a credential-key-free, allowlisted summary is published in health/CI output. No HTML or full response artifact.
-- `API_KEYS` can be configured as a comma-separated Cloudflare secret to restrict clients further. Without it the service accepts callers' own ENT credentials, with the stated abuse limits. CORS is same-origin unless an allowed origin is explicitly configured.
+- `API_KEYS` can be configured as a comma-separated Cloudflare secret to restrict clients further. Without it the service accepts callers' own ENT credentials, with the stated abuse limits. CORS is intentionally public (`Access-Control-Allow-Origin: *`): any website may call the API. Browser cookies are never accepted as ambient authentication and `Access-Control-Allow-Credentials` is not enabled.
 - Credentials are never supplied by a public 'test my environment account' endpoint.
 
 ## Workflows

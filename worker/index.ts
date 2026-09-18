@@ -130,12 +130,16 @@ export class Coordinator extends DurableObject<Env> {
 export default {
   async fetch(request:Request,env:Env):Promise<Response>{
     const url=new URL(request.url);
-    const origin=request.headers.get('origin');const origins=(env.ALLOWED_ORIGINS||'').split(',').filter(Boolean);
-    const cors:Record<string,string>={};if(origin&&(origin===url.origin||origins.includes(origin)))cors['Access-Control-Allow-Origin']=origin;
-    cors['Vary']='Origin';
+    // Public browser API: every origin may call the Worker. We deliberately do
+    // not enable Access-Control-Allow-Credentials; callers send explicit API
+    // keys/job capabilities, never ambient browser cookies.
+    const cors:Record<string,string>={
+      'Access-Control-Allow-Origin':'*',
+      'Access-Control-Expose-Headers':'X-Job-Token,Retry-After',
+    };
     const reply=(r:Response)=>{const h=new Headers(r.headers);for(const[k,v]of Object.entries(cors))h.set(k,v);return new Response(r.body,{status:r.status,headers:h});};
     try{
-      if(request.method==='OPTIONS')return reply(new Response(null,{status:204,headers:{'Access-Control-Allow-Methods':'GET,POST,DELETE,OPTIONS','Access-Control-Allow-Headers':'Content-Type,Authorization,X-API-Key,X-Job-Token','Access-Control-Expose-Headers':'X-Job-Token,Retry-After'}}));
+      if(request.method==='OPTIONS')return reply(new Response(null,{status:204,headers:{'Access-Control-Allow-Methods':'GET,POST,DELETE,OPTIONS','Access-Control-Allow-Headers':'Content-Type,Authorization,X-API-Key,X-Job-Token','Access-Control-Max-Age':'86400'}}));
       if(request.method==='GET'&&['/','/docs'].includes(url.pathname))return new Response(documentation,{headers:{'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",'X-Content-Type-Options':'nosniff'}});
       const stub=env.COORDINATOR.get(env.COORDINATOR.idFromName('pronote-v5'));
       if(['/api/v1/health','/api/health','/health','/api/v1/ready'].includes(url.pathname)){

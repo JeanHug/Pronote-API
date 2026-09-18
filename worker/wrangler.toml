@@ -10,9 +10,9 @@ tsconfig = "tsconfig.json"
 [vars]
 GITHUB_OWNER = "JeanHug"
 GITHUB_REPO = "Pronote-API"
-# Origins explicitly allowed to call the extraction routes from a browser.
-# Required for the public documentation playground hosted on GitHub Pages.
-ALLOWED_ORIGINS = "https://jeanhug.github.io"
+# Informational source-of-truth flag: the Worker emits
+# Access-Control-Allow-Origin: * for every public response.
+ALLOWED_ORIGINS = "*"
 
 [[durable_objects.bindings]]
 name = "COORDINATOR"
