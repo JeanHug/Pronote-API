@@ -1,5 +1,7 @@
 # Pronote API v5
 
+**Full documentation, exhaustive JSON reference and playground:** https://jeanhug.github.io/Pronote-API/
+
 Complete replacement of the previous v4 gateway, DOM snapshots, runner, and workflows. An unofficial, read-only connector for **ENT77 and hosted Pronote student accounts**. Not affiliated with Index Éducation. Only use accounts you are authorized to access.
 
 ## Architecture

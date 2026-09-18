@@ -1,202 +1,241 @@
 import { mkdir, writeFile } from 'node:fs/promises';
-import { VERSION, MODULES, DEFAULT_ENT, DEFAULT_PRONOTE } from '../src/pronote/contracts';
+import { readFileSync } from 'node:fs';
+import { VERSION, MODULES, type ModuleName } from '../src/pronote/contracts';
 
 const BASE = 'https://pronote-api.hugdu77777.workers.dev';
-const API = `${BASE}/api/v1`;
+const PAGES = 'https://jeanhug.github.io/Pronote-API/';
 
-type Field = {
-  path: string;
-  type: string;
-  nullable?: boolean;
-  required?: boolean;
-  description: string;
-  example?: string;
-  notes?: string;
+/** Playground inlined from a plain JS file to avoid template escaping issues. */
+const playgroundScript = readFileSync(new URL('./docs-playground.js', import.meta.url), 'utf8')
+  .replace(/__BASE__/g, BASE);
+
+/* ------------------------------------------------------------------ */
+/* Catalogue exhaustif des champs, source unique de la documentation   */
+/* ------------------------------------------------------------------ */
+
+type Row = [path: string, type: string, description: string];
+interface Group { id: string; title: string; intro: string; rows: Row[] }
+
+const groups: Group[] = [
+  {
+    id: 'enveloppe', title: 'Enveloppe de réponse', intro: 'Champs présents sur toutes les réponses, succès comme échec.',
+    rows: [
+      ['version', 'string', 'Version du contrat. Toujours "5.0.0" pour cette API.'],
+      ['success', 'boolean', 'true si au moins une rubrique demandée a pu être lue de façon vérifiable. Une réponse peut être success avec des rubriques vides.'],
+      ['status', 'string', '"done" (toutes les rubriques demandées lues), "partial" (certaines rubriques indisponibles ou en échec) ou "error" (aucune lecture possible).'],
+      ['timestamp', 'string', 'Horodatage ISO-8601 (UTC) de la fin du traitement.'],
+      ['durationMs', 'number', 'Durée totale du traitement côté moteur, en millisecondes.'],
+      ['requestId', 'string', 'Identifiant de corrélation. Réservé : non renseigné dans cette version.'],
+      ['jobId', 'string', 'Identifiant du job. Présent sur les réponses 202 et lors de la lecture d’un job.'],
+      ['jobToken', 'string', 'Jeton de lecture de 64 caractères hexadécimaux. Renvoyé une seule fois, dans le corps de la réponse 202 et dans l’en-tête X-Job-Token. À conserver côté client, jamais dans une URL.'],
+      ['statusUrl', 'string', 'Chemin relatif du suivi, de la forme /api/v1/job/&lt;jobId&gt;. À préfixer avec l’origine du Worker.'],
+      ['retryAfterSeconds', 'number', 'Délai conseillé avant la prochaine interrogation d’un job en cours.'],
+      ['data', 'object', 'Données extraites. Absent lorsque l’extraction a échoué.'],
+      ['error', 'object', 'Détail de l’échec. Absent en cas de succès.'],
+    ],
+  },
+  {
+    id: 'authentication', title: 'authentication', intro: 'Étapes d’authentification réellement franchies, sans jamais révéler d’identifiant.',
+    rows: [
+      ['authentication.ent', 'boolean', 'true si le portail ENT a accepté la connexion et confirmé la session.'],
+      ['authentication.pronote', 'boolean', 'true si l’espace élève Pronote s’est ouvert avec cette session. Peut être false si le SSO n’a pas abouti.'],
+    ],
+  },
+  {
+    id: 'modules', title: 'modules[]', intro: 'Un rapport par rubrique demandée. C’est la source de vérité sur ce qui a réellement été lu.',
+    rows: [
+      ['modules[].module', 'string', 'Nom de la rubrique. Une valeur de la liste des modules.'],
+      ['modules[].status', 'string', '"ok" (données lues), "empty" (état vide confirmé par Pronote), "unavailable" (rubrique non exposée par ce compte) ou "error" (contenu non confirmé).'],
+      ['modules[].count', 'number', 'Nombre d’éléments extraits pour cette rubrique. 0 pour empty, unavailable et error.'],
+      ['modules[].durationMs', 'number', 'Durée de lecture de cette rubrique, en millisecondes.'],
+      ['modules[].scope', 'string', 'Portée réelle de la lecture, annoncée honnêtement. Par exemple la semaine affichée, et non l’année scolaire entière.'],
+      ['modules[].code', 'string', 'Code de diagnostic présent uniquement pour les statuts unavailable et error.'],
+    ],
+  },
+  {
+    id: 'error', title: 'error', intro: 'Objet d’échec stable, exploitable par un programme, sans détail de session.',
+    rows: [
+      ['error.code', 'string', 'Code d’erreur stable. Voir la table des codes.'],
+      ['error.message', 'string', 'Message lisible en français. Ne contient jamais d’identifiant, de mot de passe ni de cookie.'],
+      ['error.stage', 'string', 'Étape atteinte : validation, ent, browser, pronote, nom de rubrique, parsing, serialization, runner ou internal.'],
+    ],
+  },
+  {
+    id: 'eleve', title: 'data.eleve', intro: 'Identité fournie par la session ENT du compte utilisé. Ce n’est pas nécessairement le nom de l’élève si le compte est un compte parent ou personnel.',
+    rows: [
+      ['data.eleve.nomComplet', 'string', 'Nom complet au format "Prénom Nom". Chaîne vide si l’ENT ne l’expose pas.'],
+      ['data.eleve.prenom', 'string', 'Prénom du titulaire du compte.'],
+      ['data.eleve.nom', 'string', 'Nom de famille du titulaire du compte.'],
+      ['data.eleve.classe', 'string | null', 'Première classe déclarée par l’ENT. null si non exposé.'],
+      ['data.eleve.etablissement', 'string | null', 'Premier établissement déclaré par l’ENT. null si non exposé.'],
+    ],
+  },
+  {
+    id: 'edt', title: 'data.emploiDuTemps', intro: 'Créneaux de la semaine actuellement affichée par Pronote. Ce n’est pas une garantie de l’année complète.',
+    rows: [
+      ['data.emploiDuTemps.totalCours', 'number', 'Nombre de créneaux extraits.'],
+      ['data.emploiDuTemps.cours[].id', 'string', 'Identifiant stable dans la réponse, de la forme cours-1, cours-2…'],
+      ['data.emploiDuTemps.cours[].matiere', 'string', 'Libellé de la matière tel qu’affiché.'],
+      ['data.emploiDuTemps.cours[].professeur', 'string | null', 'Nom de l’enseignant s’il est identifiable dans la ligne du créneau, sinon null. Aucun nom n’est deviné.'],
+      ['data.emploiDuTemps.cours[].salle', 'string | null', 'Salle si elle apparaît dans le créneau, sinon null.'],
+      ['data.emploiDuTemps.cours[].date', 'string | null', 'Date du cours au format YYYY-MM-DD, issue du libellé accessible. null si Pronote ne l’expose pas.'],
+      ['data.emploiDuTemps.cours[].heureDebut', 'string | null', 'Heure de début au format HH:MM. null si non exposée.'],
+      ['data.emploiDuTemps.cours[].heureFin', 'string | null', 'Heure de fin au format HH:MM. null si non exposée.'],
+      ['data.emploiDuTemps.cours[].annule', 'boolean', 'true si le créneau est signalé annulé ou sans enseignant.'],
+      ['data.emploiDuTemps.cours[].libelle', 'string', 'Libellé d’accessibilité complet du créneau, tel que fourni par Pronote.'],
+    ],
+  },
+  {
+    id: 'notes', title: 'data.notes', intro: 'Évaluations de la période actuellement sélectionnée. Aucune moyenne n’est recalculée.',
+    rows: [
+      ['data.notes.totalNotes', 'number', 'Nombre d’évaluations lues.'],
+      ['data.notes.periode', 'string | null', 'Libellé de la période affichée, par exemple "1er Trimestre". null si non identifiable.'],
+      ['data.notes.moyenneGenerale', 'number | null', 'Moyenne générale uniquement si elle est affichée par Pronote. null sinon : jamais recalculée par l’API.'],
+      ['data.notes.evaluations[].id', 'string', 'Identifiant stable dans la réponse, de la forme note-1, note-2…'],
+      ['data.notes.evaluations[].matiere', 'string', 'Matière de l’évaluation.'],
+      ['data.notes.evaluations[].titre', 'string | null', 'Intitulé ou détails secondaires affichés. null si absent.'],
+      ['data.notes.evaluations[].date', 'string | null', 'Date au format YYYY-MM-DD. null si non exposée.'],
+      ['data.notes.evaluations[].valeur', 'number | null', 'Note obtenue. null si la ligne n’est pas notée ou non lisible.'],
+      ['data.notes.evaluations[].sur', 'number | null', 'Barème réel de l’évaluation, par exemple 10 ou 20. null si non exposé.'],
+      ['data.notes.evaluations[].coefficient', 'number | null', 'Coefficient uniquement s’il est affiché. null sinon : aucune valeur par défaut inventée.'],
+      ['data.notes.evaluations[].libelle', 'string', 'Texte brut de la note tel qu’affiché.'],
+    ],
+  },
+  {
+    id: 'agenda', title: 'data.agenda', intro: 'Travail à faire chargé dans la vue Pronote. Portée limitée à ce qui est réellement affiché.',
+    rows: [
+      ['data.agenda.totalDevoirs', 'number', 'Nombre de devoirs lus.'],
+      ['data.agenda.devoirs[].id', 'string', 'Identifiant stable dans la réponse, de la forme devoir-1, devoir-2…'],
+      ['data.agenda.devoirs[].matiere', 'string', 'Matière du devoir.'],
+      ['data.agenda.devoirs[].pourLe', 'string | null', 'Date d’échéance au format YYYY-MM-DD, reprise de l’en-tête de section si le devoir ne la porte pas. null si non déterminable.'],
+      ['data.agenda.devoirs[].description', 'string', 'Texte complet du devoir.'],
+      ['data.agenda.devoirs[].fait', 'boolean | null', 'true si marqué fait, false si explicitement non fait, null si Pronote ne l’indique pas.'],
+      ['data.agenda.devoirs[].fichiers[]', 'object[]', 'Pièces jointes du devoir. Voir la structure Attachment.'],
+    ],
+  },
+  {
+    id: 'ressources', title: 'data.ressources', intro: 'Séances de contenus et ressources chargées dans la vue Pronote. Les séances sans pièce jointe sont conservées.',
+    rows: [
+      ['data.ressources.totalSeances', 'number', 'Nombre de séances lues.'],
+      ['data.ressources.seances[].id', 'string', 'Identifiant stable dans la réponse, de la forme seance-1, seance-2…'],
+      ['data.ressources.seances[].matiere', 'string', 'Matière de la séance.'],
+      ['data.ressources.seances[].date', 'string | null', 'Date de la séance au format YYYY-MM-DD, reprise de l’en-tête de section si nécessaire. null si non déterminable.'],
+      ['data.ressources.seances[].titre', 'string | null', 'Titre de la séance s’il existe, sinon null.'],
+      ['data.ressources.seances[].description', 'string', 'Contenu textuel de la séance.'],
+      ['data.ressources.seances[].fichiers[]', 'object[]', 'Documents attachés. Voir la structure Attachment.'],
+    ],
+  },
+  {
+    id: 'listes', title: 'data.vieScolaire, competences, actualites, cantine', intro: 'Ces rubriques exposent les entrées restituées par Pronote sous forme de texte. Elles ne sont pas décomposées en champs structurés dans cette version.',
+    rows: [
+      ['data.vieScolaire.elements[]', 'object[]', 'Entrées du carnet de vie scolaire.'],
+      ['data.competences.elements[]', 'object[]', 'Entrées d’évaluations par compétences.'],
+      ['data.actualites.elements[]', 'object[]', 'Informations et sondages. Aucun statut de lecture n’est modifié.'],
+      ['data.cantine.elements[]', 'object[]', 'Entrées de menus si la rubrique est exposée par le compte.'],
+      ['[…].elements[].id', 'string', 'Identifiant stable dans la réponse.'],
+      ['[…].elements[].texte', 'string', 'Texte de l’entrée tel que restitué par Pronote.'],
+    ],
+  },
+  {
+    id: 'attachment', title: 'Attachment (fichiers[])', intro: 'Structure commune à toutes les pièces jointes. Aucun cookie de session n’est jamais renvoyé.',
+    rows: [
+      ['fichiers[].nom', 'string', 'Nom affiché de la pièce jointe.'],
+      ['fichiers[].url', 'string | null', 'URL absolue HTTPS si le document expose un lien direct sur le même domaine. null pour les documents nécessitant une interaction, comme certains boutons de téléchargement. Aucune URL de session n’est transmise.'],
+    ],
+  },
+];
+
+const errorCodes: [code: string, http: string, description: string][] = [
+  ['INVALID_REQUEST', '400', 'Corps malformé, champ obligatoire manquant ou identifiant trop long.'],
+  ['INVALID_JSON', '400', 'Le corps n’est pas un JSON valide.'],
+  ['INVALID_URL', '400', 'pronoteUrl n’est pas une URL exploitable.'],
+  ['FORBIDDEN_HOST', '400', 'pronoteUrl ne désigne pas un espace élève HTTPS hébergé sur index-education.net, ou l’URL contient un port, une requête ou des identifiants.'],
+  ['UNSUPPORTED_ENT', '400', 'entUrl ne correspond pas à un ENT pris en charge.'],
+  ['INVALID_MODULES', '400', 'La liste modules est vide, trop longue ou contient une rubrique inconnue.'],
+  ['INVALID_CONTENT_TYPE', '415', 'Content-Type n’est pas application/json.'],
+  ['BODY_TOO_LARGE', '413', 'Corps de requête supérieur à 8 Kio.'],
+  ['UNAUTHORIZED', '401', 'Clé API absente ou invalide, ou token runner invalide sur les endpoints internes.'],
+  ['ENT_AUTH_FAILED', '401', 'L’ENT n’a pas accepté la connexion. Vérifiez les identifiants.'],
+  ['ENT_ACTION_REQUIRED', '409', 'Le portail ENT exige une action : changement de mot de passe ou validation des conditions. Cette exigence n’est jamais contournée.'],
+  ['PRONOTE_AUTH_FAILED', '401', 'La session ENT est valide mais l’espace élève Pronote ne s’est pas ouvert.'],
+  ['EXTRACTION_EMPTY', '422', 'Aucune rubrique demandée n’a pu être lue de façon vérifiable.'],
+  ['RATE_LIMITED', '429', 'Plus de cinq extractions par minute pour cette adresse IP. Respectez Retry-After.'],
+  ['JOB_EXPIRED', '404', 'Le job a expiré : les résultats sont conservés cinq minutes au maximum.'],
+  ['JOB_NOT_FOUND', '404', 'Job inconnu ou jeton de lecture X-Job-Token absent ou invalide.'],
+  ['METHOD_NOT_ALLOWED', '405', 'Méthode HTTP non autorisée sur cette route.'],
+  ['QUEUE_FULL', '503', 'Douze jobs sont déjà actifs. Réessayez plus tard.'],
+  ['RUNNER_START_FAILED', '503', 'Le moteur n’a pas pu être démarré.'],
+  ['RUNNER_UNAVAILABLE', '503', 'Aucun moteur disponible dans le délai de trois minutes.'],
+  ['JOB_INTERRUPTED', '503', 'Le moteur n’a pas remis le résultat dans le délai. Le job n’est jamais rejoué avec d’anciens identifiants.'],
+  ['NOT_CONFIGURED', '503', 'Le secret de chiffrement n’est pas configuré côté Worker.'],
+  ['UNSAFE_REDIRECT', '502', 'Redirection ENT vers un domaine non autorisé.'],
+  ['UPSTREAM_TOO_LARGE', '502', 'Réponse du portail anormalement volumineuse.'],
+  ['UPSTREAM_ERROR', '502', 'Le traitement a été interrompu à une étape amont.'],
+  ['REDIRECT_LIMIT', '502', 'Trop de redirections ENT.'],
+  ['ENGINE_ERROR', '502', 'Le moteur a interrompu le traitement.'],
+  ['EXTRACTION_TIMEOUT', '504', 'L’extraction a dépassé 150 secondes.'],
+  ['UNSAFE_RESULT', '500', 'Un contenu sensible a été bloqué avant restitution.'],
+  ['INTERNAL_ERROR', '500', 'Erreur interne inattendue. Le message technique n’est jamais divulgué.'],
+];
+
+const moduleCodes: [code: string, meaning: string][] = [
+  ['TAB_UNAVAILABLE', 'La rubrique n’est pas exposée par ce compte (par exemple l’onglet Cantine absent du menu). Statut unavailable : aucune donnée inventée.'],
+  ['CONTENT_NOT_CONFIRMED', 'La rubrique est ouverte mais aucun contenu attendu n’a été trouvé, et aucun état vide n’a pu être confirmé. Statut error.'],
+];
+
+const limits: [topic: string, value: string, behavior: string][] = [
+  ['Extractions', '5 par minute et par adresse IP', 'Fenêtre fixe de 60 s. Réponse 429 avec Retry-After.'],
+  ['Jobs actifs', '12 simultanés', 'Réponse 503 QUEUE_FULL au-delà.'],
+  ['Corps de requête', '8 Kio', 'Refus 413 avant lecture complète.'],
+  ['Résultat du moteur', '2 Mio', 'Refus 413 au-delà.'],
+  ['Identifiant / mot de passe', '200 caractères chacun', 'Refus 400.'],
+  ['Identifiants en attente', 'Chiffrés AES-GCM, supprimés à la prise en charge', 'Au plus tard 3 minutes.'],
+  ['Résultats', 'Chiffrés, 5 minutes', 'Lecture et suppression exigent X-Job-Token.'],
+  ['Durée d’extraction', '150 secondes', '504 EXTRACTION_TIMEOUT au-delà.'],
+  ['Bail d’un job', '3 minutes', 'Un job interrompu est explicitement en échec.'],
+  ['Session du moteur', '260 minutes', 'Dans un job GitHub Actions de 300 minutes.'],
+  ['Heartbeat moteur', 'Valable 65 secondes', 'Protocole v5 exigé.'],
+  ['Attente synchrone', '22 secondes', 'Puis 202 avec jobId et jobToken.'],
+  ['Suivi recommandé', 'Toutes les 3 secondes', 'Arrêtez dès que le statut HTTP n’est plus 202.'],
+  ['Nettoyage', 'Chaque minute', 'Alarme du Durable Object. Aucun cron Worker.'],
+  ['Rubriques', '8 modules', 'Statuts ok, empty, unavailable ou error.'],
+];
+
+const moduleScope: Record<ModuleName, string> = {
+  emploiDuTemps: 'Semaine affichée par Pronote',
+  notes: 'Période sélectionnée par Pronote',
+  agenda: 'Travail à faire chargé dans la vue Pronote',
+  ressources: 'Séances chargées dans la vue Pronote',
+  vieScolaire: 'Carnet affiché par Pronote',
+  competences: 'Évaluations affichées par Pronote',
+  actualites: 'Liste des informations, sans marquage de lecture',
+  cantine: 'Menus affichés par Pronote',
 };
 
-const requestFields: Field[] = [
-  { path: 'username', type: 'string', required: true, description: 'Identifiant ENT. Transmis uniquement pour l’authentification, jamais journalisé.', example: '"prenom.nom"' },
-  { path: 'password', type: 'string', required: true, description: 'Mot de passe ENT. Effacé dès la prise en charge du job (3 minutes maximum en attente).', example: '"••••••••"' },
-  { path: 'pronoteUrl', type: 'string', required: false, description: 'URL de l’espace élève Pronote. HTTPS uniquement, hôte *.index-education.net, chemin /pronote/eleve.html, sans query ni fragment.', example: `"${DEFAULT_PRONOTE}"` },
-  { path: 'entUrl', type: 'string', required: false, description: 'Portail ENT. Cette version accepte uniquement ENT77.', example: `"${DEFAULT_ENT}"` },
-  { path: 'modules', type: 'string[]', required: false, description: `Rubriques à extraire. Valeurs autorisées : ${MODULES.map((m) => `\`${m}\``).join(', ')}. Dédupliquées. Défaut : toutes.`, example: '["emploiDuTemps","notes","agenda","ressources"]' },
-];
+const moduleLabel: Record<ModuleName, string> = {
+  emploiDuTemps: 'Emploi du temps', notes: 'Notes', agenda: 'Travail à faire', ressources: 'Contenus et ressources',
+  vieScolaire: 'Vie scolaire', competences: 'Compétences', actualites: 'Actualités', cantine: 'Cantine',
+};
 
-const responseFields: Field[] = [
-  { path: 'version', type: 'string', description: 'Version du contrat API.', example: `"${VERSION}"` },
-  { path: 'success', type: 'boolean', description: 'true si au moins une rubrique a pu être lue de façon vérifiable (ok ou empty confirmé). false en cas d’échec global.', example: 'true' },
-  { path: 'status', type: 'string', description: '`done` (tout lu), `partial` (certaines rubriques indisponibles ou en erreur), `error` (échec).', example: '"partial"' },
-  { path: 'requestId', type: 'string', nullable: true, description: 'Identifiant du job. Présent aussi sous `jobId` dans les réponses 202.', example: '"3f8a2c10-9b4e-4a7d-8c1f-2e5b9d0a7c34"' },
-  { path: 'jobId', type: 'string', nullable: true, description: 'Alias public de requestId, renvoyé notamment sur 202.', example: '"3f8a2c10-9b4e-4a7d-8c1f-2e5b9d0a7c34"' },
-  { path: 'jobToken', type: 'string', nullable: true, description: 'Jeton de lecture de 256 bits. Obligatoire en en-tête X-Job-Token pour GET/DELETE /job/:id. Ne jamais le mettre dans l’URL ni dans un log public.', example: '"a1b2…64 hex"' },
-  { path: 'statusUrl', type: 'string', nullable: true, description: 'Chemin relatif de suivi du job.', example: '"/api/v1/job/3f8a2c10-…"' },
-  { path: 'timestamp', type: 'string', description: 'Horodatage ISO-8601 de fin de traitement.', example: '"2026-09-18T15:34:44.986Z"' },
-  { path: 'durationMs', type: 'number', description: 'Durée totale d’extraction côté moteur, en millisecondes.', example: '45477' },
-  { path: 'authentication.ent', type: 'boolean', description: 'true si la session ENT a été confirmée via /auth/oauth2/userinfo.', example: 'true' },
-  { path: 'authentication.pronote', type: 'boolean', description: 'true si l’espace élève Pronote a réellement chargé son interface authentifiée.', example: 'true' },
-  { path: 'modules[].module', type: 'string', description: 'Nom de la rubrique extraite.', example: '"emploiDuTemps"' },
-  { path: 'modules[].status', type: 'string', description: '`ok` (données), `empty` (page valide sans contenu), `unavailable` (menu absent), `error` (lecture non confirmée).', example: '"ok"' },
-  { path: 'modules[].count', type: 'number', description: 'Nombre d’éléments extraits pour cette rubrique.', example: '26' },
-  { path: 'modules[].durationMs', type: 'number', description: 'Durée de navigation et de parsing de la rubrique.', example: '3704' },
-  { path: 'modules[].scope', type: 'string', description: 'Portée honnête de la lecture (semaine affichée, période sélectionnée, etc.).', example: '"Semaine affichée par Pronote"' },
-  { path: 'modules[].code', type: 'string', nullable: true, description: 'Code technique optionnel (`TAB_UNAVAILABLE`, `CONTENT_NOT_CONFIRMED`…).', example: '"TAB_UNAVAILABLE"' },
-  { path: 'error.code', type: 'string', nullable: true, description: 'Code d’erreur stable en cas d’échec.', example: '"ENT_AUTH_FAILED"' },
-  { path: 'error.message', type: 'string', nullable: true, description: 'Message lisible, sans détail de session ni identifiant.', example: '"L’ENT n’a pas accepté cette connexion."' },
-  { path: 'error.stage', type: 'string', nullable: true, description: 'Étape d’échec : validation, ent, browser, pronote, parsing, runner, internal…', example: '"ent"' },
-  { path: 'data.eleve.nomComplet', type: 'string', description: 'Nom complet issu de la session ENT (titulaire du compte).', example: '"Lucas Dupont"' },
-  { path: 'data.eleve.prenom', type: 'string', description: 'Prénom issu de la session ENT.', example: '"Lucas"' },
-  { path: 'data.eleve.nom', type: 'string', description: 'Nom de famille issu de la session ENT.', example: '"Dupont"' },
-  { path: 'data.eleve.classe', type: 'string', nullable: true, description: 'Classe si exposée par l’ENT. null sinon.', example: '"3EME6"' },
-  { path: 'data.eleve.etablissement', type: 'string', nullable: true, description: 'Établissement si exposé par l’ENT. null sinon.', example: '"COLLÈGE ROSA BONHEUR"' },
-  { path: 'data.emploiDuTemps.totalCours', type: 'number', description: 'Nombre de créneaux extraits pour la semaine affichée.', example: '26' },
-  { path: 'data.emploiDuTemps.cours[].id', type: 'string', description: 'Identifiant stable dans la réponse.', example: '"cours-1"' },
-  { path: 'data.emploiDuTemps.cours[].matiere', type: 'string', description: 'Matière du créneau.', example: '"MATHÉMATIQUES"' },
-  { path: 'data.emploiDuTemps.cours[].professeur', type: 'string', nullable: true, description: 'Enseignant si reconnu. null si absent ou non identifiable.', example: '"M. LECLERC"' },
-  { path: 'data.emploiDuTemps.cours[].salle', type: 'string', nullable: true, description: 'Salle si reconnue (codes, Gymnase, CDI…). null sinon.', example: '"204"' },
-  { path: 'data.emploiDuTemps.cours[].date', type: 'string', nullable: true, description: 'Date ISO YYYY-MM-DD déduite du libellé accessible.', example: '"2026-09-14"' },
-  { path: 'data.emploiDuTemps.cours[].heureDebut', type: 'string', nullable: true, description: 'Heure de début HH:MM.', example: '"08:30"' },
-  { path: 'data.emploiDuTemps.cours[].heureFin', type: 'string', nullable: true, description: 'Heure de fin HH:MM.', example: '"10:20"' },
-  { path: 'data.emploiDuTemps.cours[].annule', type: 'boolean', description: 'true si le libellé indique une annulation ou une absence.', example: 'false' },
-  { path: 'data.emploiDuTemps.cours[].libelle', type: 'string', description: 'Libellé accessible d’origine (aria-label).', example: '"Cours du 14 septembre de 8 heures 30 à 10 heures 20"' },
-  { path: 'data.notes.totalNotes', type: 'number', description: 'Nombre d’évaluations extraites pour la période affichée.', example: '2' },
-  { path: 'data.notes.periode', type: 'string', nullable: true, description: 'Période sélectionnée dans Pronote, si lisible.', example: '"1er Trimestre"' },
-  { path: 'data.notes.moyenneGenerale', type: 'number', nullable: true, description: 'Moyenne générale si exposée textuellement. null sinon. Jamais recalculée à partir d’hypothèses.', example: '15.82' },
-  { path: 'data.notes.evaluations[].id', type: 'string', description: 'Identifiant de l’évaluation dans la réponse.', example: '"note-1"' },
-  { path: 'data.notes.evaluations[].matiere', type: 'string', description: 'Matière de l’évaluation.', example: '"MATHÉMATIQUES"' },
-  { path: 'data.notes.evaluations[].titre', type: 'string', nullable: true, description: 'Intitulé ou complément d’information.', example: '"Contrôle chap. 2"' },
-  { path: 'data.notes.evaluations[].date', type: 'string', nullable: true, description: 'Date ISO si parsable.', example: '"2026-09-11"' },
-  { path: 'data.notes.evaluations[].valeur', type: 'number', nullable: true, description: 'Note brute. null si non notée / absente / non numérique.', example: '16.5' },
-  { path: 'data.notes.evaluations[].sur', type: 'number', nullable: true, description: 'Barème. Conservé tel quel (peut être 10, 20…). null si inconnu.', example: '20' },
-  { path: 'data.notes.evaluations[].coefficient', type: 'number', nullable: true, description: 'Coefficient réel si exposé. null si Pronote ne le montre pas. Jamais forcé à 1.', example: '3' },
-  { path: 'data.notes.evaluations[].libelle', type: 'string', description: 'Texte brut de la note tel qu’affiché.', example: '"16,5 / 20"' },
-  { path: 'data.agenda.totalDevoirs', type: 'number', description: 'Nombre de devoirs extraits de la vue Travail à faire.', example: '26' },
-  { path: 'data.agenda.devoirs[].id', type: 'string', description: 'Identifiant du devoir.', example: '"devoir-1"' },
-  { path: 'data.agenda.devoirs[].matiere', type: 'string', description: 'Matière du devoir.', example: '"FRANÇAIS"' },
-  { path: 'data.agenda.devoirs[].pourLe', type: 'string', nullable: true, description: 'Date d’échéance ISO si déductible du contexte de page.', example: '"2026-09-18"' },
-  { path: 'data.agenda.devoirs[].description', type: 'string', description: 'Énoncé complet, sans corruption du mot « fait ».', example: '"Lire le chapitre 3 et répondre aux questions 1 à 5."' },
-  { path: 'data.agenda.devoirs[].fait', type: 'boolean', nullable: true, description: 'true/false si l’état est exposé, null sinon.', example: 'false' },
-  { path: 'data.agenda.devoirs[].fichiers[].nom', type: 'string', description: 'Nom de la pièce jointe.', example: '"chapitre3.pdf"' },
-  { path: 'data.agenda.devoirs[].fichiers[].url', type: 'string', nullable: true, description: 'URL HTTPS absolue purgée de ticket/session. null si le bouton n’expose pas de lien direct.', example: '"https://….index-education.net/pronote/FichiersExternes/…"' },
-  { path: 'data.ressources.totalSeances', type: 'number', description: 'Nombre de séances extraites, y compris sans pièce jointe.', example: '49' },
-  { path: 'data.ressources.seances[].id', type: 'string', description: 'Identifiant de la séance.', example: '"seance-1"' },
-  { path: 'data.ressources.seances[].matiere', type: 'string', description: 'Matière de la séance.', example: '"HISTOIRE-GÉOGRAPHIE"' },
-  { path: 'data.ressources.seances[].date', type: 'string', nullable: true, description: 'Date ISO si déductible.', example: '"2026-09-10"' },
-  { path: 'data.ressources.seances[].titre', type: 'string', nullable: true, description: 'Titre de séance s’il existe.', example: '"La Révolution française"' },
-  { path: 'data.ressources.seances[].description', type: 'string', description: 'Contenu textuel de la séance.', example: '"Séance 1 : contexte et causes."' },
-  { path: 'data.ressources.seances[].fichiers[].nom', type: 'string', description: 'Nom du document joint.', example: '"cours.pdf"' },
-  { path: 'data.ressources.seances[].fichiers[].url', type: 'string', nullable: true, description: 'URL HTTPS absolue sans paramètre de session, ou null.', example: 'null' },
-  { path: 'data.vieScolaire.elements[].id', type: 'string', description: 'Identifiant d’un élément du carnet (absence, retard…).', example: '"vieScolaire-1"' },
-  { path: 'data.vieScolaire.elements[].texte', type: 'string', description: 'Texte rendu par Pronote. Structure libre tant que la vue ne fournit pas de champs stables.', example: '"Absence justifiée — 08/09"' },
-  { path: 'data.competences.elements[].id', type: 'string', description: 'Identifiant d’une évaluation de compétences affichée.', example: '"competences-1"' },
-  { path: 'data.competences.elements[].texte', type: 'string', description: 'Texte de la compétence / évaluation telle qu’affichée.', example: '"Comprendre un texte — Satisfaisant"' },
-  { path: 'data.actualites.elements[].id', type: 'string', description: 'Identifiant d’une information ou d’un sondage listé.', example: '"actualites-1"' },
-  { path: 'data.actualites.elements[].texte', type: 'string', description: 'Texte de l’actualité. Lecture seule, aucun marquage de lecture.', example: '"Sortie scolaire le 25 septembre"' },
-  { path: 'data.cantine.elements[].id', type: 'string', description: 'Identifiant d’un menu affiché.', example: '"cantine-1"' },
-  { path: 'data.cantine.elements[].texte', type: 'string', description: 'Texte du menu. Si le menu n’existe pas pour le compte, la rubrique vaut unavailable.', example: '"Lundi — salade, poisson, yaourt"' },
-];
-
-const errors = [
-  { code: 'INVALID_REQUEST', http: 400, meaning: 'JSON manquant, champs obligatoires absents ou trop longs.' },
-  { code: 'INVALID_JSON', http: 400, meaning: 'Corps non JSON.' },
-  { code: 'INVALID_CONTENT_TYPE', http: 415, meaning: 'Content-Type application/json requis.' },
-  { code: 'BODY_TOO_LARGE', http: 413, meaning: 'Corps > 8 Kio (requête) ou > 2 Mio (résultat runner).' },
-  { code: 'INVALID_URL', http: 400, meaning: 'pronoteUrl mal formée.' },
-  { code: 'FORBIDDEN_HOST', http: 400, meaning: 'Hôte/chemin Pronote non autorisé (SSRF).' },
-  { code: 'UNSUPPORTED_ENT', http: 400, meaning: 'ENT hors ENT77.' },
-  { code: 'INVALID_MODULES', http: 400, meaning: 'Liste modules invalide ou inconnue.' },
-  { code: 'UNAUTHORIZED', http: 401, meaning: 'Clé API absente/invalide, ou token runner invalide.' },
-  { code: 'ENT_AUTH_FAILED', http: 401, meaning: 'Identifiants ENT refusés ou session non confirmée.' },
-  { code: 'ENT_ACTION_REQUIRED', http: 409, meaning: 'Action requise sur l’ENT (mot de passe / CGU).' },
-  { code: 'PRONOTE_AUTH_FAILED', http: 401, meaning: 'ENT OK mais espace élève Pronote non ouvert.' },
-  { code: 'RATE_LIMITED', http: 429, meaning: 'Plus de 5 extractions / minute / IP.' },
-  { code: 'QUEUE_FULL', http: 503, meaning: 'Plus de 12 jobs actifs.' },
-  { code: 'RUNNER_START_FAILED', http: 503, meaning: 'Impossible de démarrer le moteur navigateur.' },
-  { code: 'RUNNER_UNAVAILABLE', http: 503, meaning: 'Aucun runner disponible dans le délai d’attente.' },
-  { code: 'JOB_INTERRUPTED', http: 503, meaning: 'Job pris puis non terminé dans le bail de 3 minutes.' },
-  { code: 'JOB_NOT_FOUND', http: 404, meaning: 'Job inconnu, expiré ou jeton de lecture invalide.' },
-  { code: 'EXTRACTION_TIMEOUT', http: 504, meaning: 'Extraction > 150 secondes.' },
-  { code: 'EXTRACTION_EMPTY', http: 502, meaning: 'Aucune rubrique lisible de façon vérifiable.' },
-  { code: 'UPSTREAM_ERROR', http: 502, meaning: 'Interruption technique amont, sans détail de session.' },
-  { code: 'INTERNAL_ERROR', http: 500, meaning: 'Erreur interne. Le message public reste générique.' },
-];
-
-const exampleResponse = {
+const example = {
   version: VERSION,
   success: true,
   status: 'partial',
-  requestId: '3f8a2c10-9b4e-4a7d-8c1f-2e5b9d0a7c34',
   timestamp: '2026-09-18T15:34:44.986Z',
-  durationMs: 45477,
+  durationMs: 23723,
   authentication: { ent: true, pronote: true },
   modules: [
-    { module: 'emploiDuTemps', status: 'ok', count: 26, durationMs: 3704, scope: 'Semaine affichée par Pronote' },
+    { module: 'emploiDuTemps', status: 'ok', count: 26, durationMs: 3742, scope: 'Semaine affichée par Pronote' },
     { module: 'notes', status: 'ok', count: 2, durationMs: 3698, scope: 'Période sélectionnée par Pronote' },
-    { module: 'agenda', status: 'ok', count: 26, durationMs: 3711, scope: 'Travail à faire chargé dans la vue Pronote' },
-    { module: 'ressources', status: 'ok', count: 49, durationMs: 3735, scope: 'Séances chargées dans la vue Pronote' },
-    { module: 'vieScolaire', status: 'empty', count: 0, durationMs: 7697, scope: 'Carnet affiché par Pronote' },
-    { module: 'competences', status: 'empty', count: 0, durationMs: 7693, scope: 'Évaluations affichées par Pronote' },
-    { module: 'actualites', status: 'empty', count: 0, durationMs: 7691, scope: 'Liste des informations, sans marquage de lecture' },
+    { module: 'agenda', status: 'ok', count: 30, durationMs: 3748, scope: 'Travail à faire chargé dans la vue Pronote' },
     { module: 'cantine', status: 'unavailable', count: 0, durationMs: 1, scope: 'Menus affichés par Pronote', code: 'TAB_UNAVAILABLE' },
   ],
   data: {
-    eleve: {
-      nomComplet: 'Lucas Dupont',
-      prenom: 'Lucas',
-      nom: 'Dupont',
-      classe: '3EME6',
-      etablissement: 'COLLÈGE ROSA BONHEUR',
-    },
-    emploiDuTemps: {
-      totalCours: 1,
-      cours: [{
-        id: 'cours-1',
-        matiere: 'MATHÉMATIQUES',
-        professeur: 'M. LECLERC',
-        salle: '204',
-        date: '2026-09-14',
-        heureDebut: '08:30',
-        heureFin: '10:20',
-        annule: false,
-        libelle: 'Cours du 14 septembre de 8 heures 30 à 10 heures 20',
-      }],
-    },
-    notes: {
-      totalNotes: 1,
-      periode: '1er Trimestre',
-      moyenneGenerale: null,
-      evaluations: [{
-        id: 'note-1',
-        matiere: 'MATHÉMATIQUES',
-        titre: 'Contrôle chap. 2',
-        date: '2026-09-11',
-        valeur: 16.5,
-        sur: 20,
-        coefficient: 3,
-        libelle: '16,5 / 20',
-      }],
-    },
-    agenda: {
-      totalDevoirs: 1,
-      devoirs: [{
-        id: 'devoir-1',
-        matiere: 'FRANÇAIS',
-        pourLe: '2026-09-18',
-        description: 'Lire le chapitre 3 et répondre aux questions 1 à 5.',
-        fait: false,
-        fichiers: [{ nom: 'chapitre3.pdf', url: null }],
-      }],
-    },
-    ressources: {
-      totalSeances: 1,
-      seances: [{
-        id: 'seance-1',
-        matiere: 'HISTOIRE-GÉOGRAPHIE',
-        date: '2026-09-10',
-        titre: 'La Révolution française',
-        description: 'Séance 1 : contexte et causes.',
-        fichiers: [],
-      }],
-    },
+    eleve: { nomComplet: 'Lucas DUPONT', prenom: 'Lucas', nom: 'DUPONT', classe: '3EME6', etablissement: 'COLLEGE ROSA BONHEUR' },
+    emploiDuTemps: { totalCours: 1, cours: [{ id: 'cours-1', matiere: 'MATHEMATIQUES', professeur: 'M. LECLERC', salle: '204', date: '2026-09-14', heureDebut: '08:30', heureFin: '10:20', annule: false, libelle: 'Cours du 14 septembre 2026 de 8 heures 30 à 10 heures 20' }] },
+    notes: { totalNotes: 1, periode: '1er Trimestre', moyenneGenerale: null, evaluations: [{ id: 'note-1', matiere: 'MATHEMATIQUES', titre: 'Contrôle', date: '2026-09-11', valeur: 7.5, sur: 10, coefficient: null, libelle: '7,5 / 10' }] },
+    agenda: { totalDevoirs: 1, devoirs: [{ id: 'devoir-1', matiere: 'FRANCAIS', pourLe: '2026-09-18', description: 'Lire le chapitre 3 et répondre aux questions 1 à 5.', fait: false, fichiers: [{ nom: 'chapitre3.pdf', url: null }] }] },
+    ressources: { totalSeances: 1, seances: [{ id: 'seance-1', matiere: 'HISTOIRE-GEOGRAPHIE', date: '2026-09-10', titre: 'La Révolution française', description: 'Séance 1 : contexte et causes.', fichiers: [] }] },
     vieScolaire: { elements: [] },
     competences: { elements: [] },
     actualites: { elements: [] },
@@ -204,816 +243,394 @@ const exampleResponse = {
   },
 };
 
-function esc(value: string): string {
-  return value
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
-}
+/* ------------------------------------------------------------------ */
+/* Rendu                                                               */
+/* ------------------------------------------------------------------ */
 
-function fieldsTable(fields: Field[]): string {
-  return `<div class="table-wrap"><table>
-<thead><tr><th>Chemin</th><th>Type</th><th>Null</th><th>Description</th><th>Exemple</th></tr></thead>
-<tbody>
-${fields.map((f) => `<tr>
-<td><code>${esc(f.path)}</code></td>
-<td>${esc(f.type)}${f.required ? ' <span class="pill">requis</span>' : ''}</td>
-<td>${f.nullable ? 'oui' : 'non'}</td>
-<td>${esc(f.description)}${f.notes ? `<div class="note">${esc(f.notes)}</div>` : ''}</td>
-<td>${f.example ? `<code>${esc(f.example)}</code>` : '—'}</td>
-</tr>`).join('')}
-</tbody></table></div>`;
-}
+const esc = (value: string) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const table = (head: string[], rows: string[][]) =>
+  `<div class="tablewrap"><table><thead><tr>${head.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.map(r => `<tr>${r.map((c, i) => `<td${i === 0 ? ' data-label="' + esc(head[0]) + '"' : ''}>${c}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
 
-const css = `
-:root {
-  --bg: #ffffff;
-  --ink: #111827;
-  --muted: #6b7280;
-  --line: #e5e7eb;
-  --soft: #f8fafc;
-  --soft-2: #f3f4f6;
-  --accent: #111827;
-  --ok: #065f46;
-  --ok-bg: #ecfdf5;
-  --warn: #92400e;
-  --warn-bg: #fffbeb;
-  --bad: #991b1b;
-  --bad-bg: #fef2f2;
-  --code: #0f172a;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --sans: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-}
-* { box-sizing: border-box; }
-html { scroll-behavior: smooth; scroll-padding-top: 88px; }
-body {
-  margin: 0;
-  font: 15px/1.6 var(--sans);
-  color: var(--ink);
-  background: var(--bg);
-}
-a { color: var(--ink); }
-code, pre, kbd { font-family: var(--mono); }
-code, kbd {
-  font-size: 12.5px;
-  background: var(--soft-2);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 1px 6px;
-}
-pre {
-  margin: 0;
-  padding: 16px;
-  overflow: auto;
-  background: #0b1220;
-  color: #e5eefc;
-  border-radius: 12px;
-  border: 1px solid #111827;
-  font-size: 12.5px;
-  line-height: 1.7;
-}
-.layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: 100vh; }
-.side {
-  position: sticky; top: 0; height: 100vh; overflow: auto;
-  border-right: 1px solid var(--line);
-  background: #fff;
-  padding: 28px 18px 40px;
-}
-.brand { display: flex; gap: 10px; align-items: center; margin-bottom: 28px; }
-.brand-mark {
-  width: 34px; height: 34px; border-radius: 10px;
-  display: grid; place-items: center;
-  background: #111827; color: white; font-weight: 700; font-size: 13px;
-}
-.brand strong { display: block; font-size: 14px; letter-spacing: -0.02em; }
-.brand span { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
-.side nav { display: flex; flex-direction: column; gap: 4px; }
-.side a {
-  text-decoration: none;
-  color: #374151;
-  border-radius: 8px;
-  padding: 9px 10px;
-  font-size: 13.5px;
-}
-.side a:hover { background: var(--soft); }
-.side .group { margin: 18px 0 8px; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #9ca3af; font-weight: 700; }
-.main { min-width: 0; }
-.top {
-  position: sticky; top: 0; z-index: 5;
-  backdrop-filter: blur(10px);
-  background: rgba(255,255,255,0.9);
-  border-bottom: 1px solid var(--line);
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 14px 28px; gap: 12px;
-}
-.top .meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-.chip {
-  display: inline-flex; align-items: center; gap: 6px;
-  border: 1px solid var(--line); border-radius: 999px;
-  padding: 5px 10px; font-size: 12px; color: #374151; background: #fff;
-}
-.chip.ok { background: var(--ok-bg); color: var(--ok); border-color: #a7f3d0; }
-.content { max-width: 980px; margin: 0 auto; padding: 36px 28px 80px; }
-.hero h1 {
-  margin: 0 0 10px;
-  font-size: clamp(30px, 5vw, 44px);
-  letter-spacing: -0.04em;
-  line-height: 1.1;
-}
-.hero p { color: var(--muted); max-width: 62ch; margin: 0 0 18px; }
-.hero-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 28px; }
-.btn {
-  appearance: none; border: 1px solid var(--line); background: #fff; color: var(--ink);
-  border-radius: 10px; padding: 10px 14px; font: inherit; font-size: 13.5px; cursor: pointer;
-  text-decoration: none; display: inline-flex; align-items: center; gap: 8px;
-}
-.btn.primary { background: #111827; color: #fff; border-color: #111827; }
-.btn:hover { background: var(--soft); }
-.btn.primary:hover { background: #000; }
-.btn:disabled { opacity: 0.55; cursor: wait; }
-.grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 22px 0 34px; }
-.card {
-  border: 1px solid var(--line); border-radius: 14px; padding: 16px;
-  background: #fff;
-}
-.card h3 { margin: 0 0 6px; font-size: 14px; }
-.card p { margin: 0; color: var(--muted); font-size: 13px; }
-section { margin: 42px 0; scroll-margin-top: 88px; }
-section > h2 {
-  margin: 0 0 8px;
-  font-size: 24px;
-  letter-spacing: -0.03em;
-}
-.lead { color: var(--muted); margin: 0 0 18px; max-width: 70ch; }
-.table-wrap {
-  overflow: auto;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: #fff;
-}
-table { width: 100%; border-collapse: collapse; min-width: 720px; }
-th, td {
-  text-align: left; vertical-align: top;
-  padding: 12px 14px; border-bottom: 1px solid var(--line);
-  font-size: 13px;
-}
-th { background: var(--soft); color: #374151; font-weight: 600; position: sticky; top: 0; }
-tr:last-child td { border-bottom: 0; }
-.pill {
-  display: inline-block;
-  font-size: 10px;
-  border-radius: 999px;
-  padding: 2px 7px;
-  background: #eef2ff;
-  color: #3730a3;
-  border: 1px solid #c7d2fe;
-}
-.note { color: var(--muted); font-size: 12px; margin-top: 4px; }
-.callout {
-  border: 1px solid var(--line);
-  background: var(--soft);
-  border-radius: 14px;
-  padding: 14px 16px;
-  color: #374151;
-  font-size: 13.5px;
-}
-.callout.warn { background: var(--warn-bg); border-color: #fde68a; color: var(--warn); }
-.callout.bad { background: var(--bad-bg); border-color: #fecaca; color: var(--bad); }
-.two { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 16px; }
-.stack { display: grid; gap: 12px; }
-.kvs { display: grid; gap: 8px; }
-.kv {
-  display: grid; grid-template-columns: 160px minmax(0, 1fr);
-  gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 13.5px;
-}
-.kv:last-child { border-bottom: 0; }
-.kv b { color: #111827; font-weight: 600; }
-.kv span { color: #4b5563; }
-.modules { display: flex; flex-wrap: wrap; gap: 8px; }
-.tag {
-  border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px;
-  font-size: 12px; background: #fff;
-}
-.playground {
-  border: 1px solid var(--line);
-  border-radius: 18px;
-  overflow: hidden;
-  background: #fff;
-  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.04);
-}
-.playground-grid { display: grid; grid-template-columns: 360px minmax(0, 1fr); }
-.play-form, .play-result { padding: 18px; }
-.play-form { border-right: 1px solid var(--line); background: #fcfcfd; }
-.play-result { background: #fff; min-height: 620px; display: flex; flex-direction: column; }
-label { display: block; font-size: 12px; font-weight: 600; color: #374151; margin: 0 0 6px; }
-input[type="text"], input[type="password"], input[type="url"], select, textarea {
-  width: 100%;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 11px 12px;
-  font: inherit;
-  font-size: 14px;
-  background: #fff;
-  color: var(--ink);
-}
-textarea { min-height: 110px; resize: vertical; font-family: var(--mono); font-size: 12.5px; }
-.field { margin-bottom: 14px; }
-.help { color: var(--muted); font-size: 12px; margin-top: 6px; }
-.checkboxes { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; }
-.check {
-  display: flex; gap: 8px; align-items: center;
-  border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: #fff;
-  font-size: 12.5px;
-}
-.check input { accent-color: #111827; }
-.row { display: flex; gap: 8px; flex-wrap: wrap; }
-.status-line {
-  display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
-  padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--soft);
-  margin-bottom: 12px; font-size: 13px;
-}
-.status-line .dot {
-  width: 8px; height: 8px; border-radius: 50%; background: #9ca3af;
-}
-.status-line.ok .dot { background: #059669; }
-.status-line.err .dot { background: #dc2626; }
-.status-line.run .dot { background: #2563eb; box-shadow: 0 0 0 4px rgba(37,99,235,0.12); }
-.play-output {
-  flex: 1;
-  margin: 0;
-  border-radius: 12px;
-  min-height: 420px;
-}
-.footer {
-  margin-top: 56px; padding-top: 18px; border-top: 1px solid var(--line);
-  color: var(--muted); font-size: 12.5px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
-}
-.mobile-nav { display: none; }
-@media (max-width: 980px) {
-  .layout { grid-template-columns: 1fr; }
-  .side { display: none; }
-  .mobile-nav { display: block; }
-  .grid, .two, .playground-grid { grid-template-columns: 1fr; }
-  .play-form { border-right: 0; border-bottom: 1px solid var(--line); }
-  .kv { grid-template-columns: 1fr; gap: 4px; }
-  .content { padding: 24px 16px 64px; }
-  .top { padding: 12px 16px; }
-  table { min-width: 640px; }
-}
-`;
+const nav = [
+  ['intro', 'Présentation'], ['architecture', 'Architecture'], ['auth', 'Authentification'],
+  ['endpoints', 'Endpoints'], ['request', 'Corps de requête'], ['response', 'Réponses et suivi'],
+  ['fields', 'Référence JSON'], ['modules', 'Rubriques'], ['errors', 'Codes d’erreur'],
+  ['limits', 'Limites et rétention'], ['playground', 'Playground'],
+];
 
-const html = `<!doctype html>
+const page = `<!doctype html>
 <html lang="fr">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Pronote API v${VERSION} — Documentation</title>
-  <meta name="description" content="Documentation complète de Pronote API v${VERSION} : endpoints, schéma JSON exhaustif, limites, sécurité et playground." />
-  <link rel="canonical" href="https://jeanhug.github.io/Pronote-API/" />
-  <style>${css}</style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pronote API ${VERSION} — Documentation</title>
+<meta name="description" content="Documentation complète de l’API Pronote ${VERSION} : endpoints, référence exhaustive du JSON, codes d’erreur, limites et playground.">
+<link rel="canonical" href="${PAGES}">
+<style>
+:root{--ink:#16191c;--body:#3d444d;--soft:#6b7480;--line:#e6e9ed;--line2:#f0f2f5;--bg:#fff;--code:#f7f8fa;--accent:#0f6b56;--accent2:#0b5443;--warn:#8a5a00;--warnbg:#fff8e8;--warnline:#f0dfae;--err:#a33a3a;--monospace:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth;scroll-padding-top:76px}
+body{margin:0;background:var(--bg);color:var(--body);font:16px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}
+h1,h2,h3,h4{color:var(--ink);line-height:1.25;margin:0}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--monospace);font-size:.875em;background:var(--code);border:1px solid var(--line);border-radius:4px;padding:.1em .35em;color:var(--ink);word-break:break-word}
+pre{font-family:var(--monospace);font-size:13px;line-height:1.65;background:var(--code);border:1px solid var(--line);border-radius:8px;padding:16px;overflow:auto;margin:0}
+pre code{background:none;border:0;padding:0;font-size:inherit}
+.topbar{position:sticky;top:0;z-index:60;background:rgba(255,255,255,.93);backdrop-filter:saturate(180%) blur(12px);border-bottom:1px solid var(--line)}
+.topbar-in{max-width:1180px;margin:0 auto;padding:12px 20px;display:flex;align-items:center;gap:14px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:650;color:var(--ink);font-size:15px;letter-spacing:-.2px}
+.brand:hover{text-decoration:none}
+.mark{width:26px;height:26px;border-radius:7px;background:var(--accent);color:#fff;display:grid;place-items:center;font:700 12px/1 var(--monospace)}
+.ver{font:600 11px/1 var(--monospace);color:var(--accent2);background:#eaf5f1;border:1px solid #cfe6dd;border-radius:20px;padding:5px 10px}
+.top-links{margin-left:auto;display:flex;align-items:center;gap:16px;font-size:13px}
+.burger{display:none;margin-left:auto;background:none;border:1px solid var(--line);border-radius:6px;padding:7px 9px;cursor:pointer}
+.burger span{display:block;width:16px;height:1.6px;background:var(--ink);margin:3px 0}
+.layout{max-width:1180px;margin:0 auto;padding:0 20px;display:grid;grid-template-columns:218px minmax(0,1fr);gap:52px}
+aside{position:sticky;top:70px;align-self:start;padding:30px 0 60px;max-height:calc(100vh - 90px);overflow:auto}
+aside nav{display:flex;flex-direction:column;gap:1px;border-left:1px solid var(--line)}
+aside a{padding:7px 0 7px 15px;margin-left:-1px;border-left:2px solid transparent;color:var(--soft);font-size:13.5px}
+aside a:hover{color:var(--ink);text-decoration:none}
+aside a.active{color:var(--accent2);border-left-color:var(--accent);font-weight:550}
+main{min-width:0;padding:34px 0 90px;max-width:760px}
+.hero h1{font-size:34px;letter-spacing:-1.1px;font-weight:700}
+.hero p{font-size:17px;color:var(--body);margin:16px 0 0;max-width:620px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:20px}
+.chip{font-size:12px;color:var(--soft);border:1px solid var(--line);border-radius:20px;padding:5px 11px}
+section{padding-top:44px;margin-top:8px}
+section:first-of-type{padding-top:0;margin-top:0}
+h2{font-size:23px;letter-spacing:-.5px;font-weight:680;padding-bottom:10px;border-bottom:1px solid var(--line)}
+h3{font-size:16px;margin:28px 0 8px;font-weight:640}
+h4{font-size:14px;margin:20px 0 6px;font-weight:640}
+.lead{margin:14px 0 0;font-size:15.5px}
+p{margin:12px 0}
+ul,ol{padding-left:22px;margin:12px 0}
+li{margin:6px 0}
+.note{background:#f7faf9;border:1px solid #dcebe5;border-left:3px solid var(--accent);border-radius:6px;padding:13px 16px;font-size:14.5px;margin:18px 0}
+.warn{background:var(--warnbg);border:1px solid var(--warnline);border-left:3px solid #d19a00;border-radius:6px;padding:13px 16px;font-size:14.5px;margin:18px 0}
+.tablewrap{margin:16px 0;overflow-x:auto;border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:520px}
+th{background:#fbfcfd;text-align:left;font-weight:620;color:var(--ink);font-size:12.5px;padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:11px 14px;border-bottom:1px solid var(--line2);vertical-align:top}
+tbody tr:last-child td{border-bottom:0}
+td:first-child{font-family:var(--monospace);font-size:12.5px;color:var(--ink);white-space:nowrap}
+td:last-child{color:var(--body)}
+.pill{display:inline-block;font:600 11px/1 var(--monospace);border-radius:4px;padding:4px 7px;color:#fff}
+.pill.g{background:var(--accent)}.pill.o{background:#b06a00}.pill.r{background:var(--err)}.pill.b{background:#33518f}.pill.n{background:#5d6874}
+.anchor{display:flex;align-items:center;gap:9px}
+.anchor .pill{flex-shrink:0}
+details{border:1px solid var(--line);border-radius:8px;padding:0;margin:14px 0;background:#fdfdfe}
+details>summary{cursor:pointer;padding:13px 16px;font-size:14px;font-weight:550;color:var(--ink);list-style:none;display:flex;align-items:center;gap:8px}
+details>summary::-webkit-details-marker{display:none}
+details>summary:after{content:"+";margin-left:auto;color:var(--soft);font-size:16px}
+details[open]>summary:after{content:"–"}
+details>div{padding:0 16px 16px}
+.methods{display:flex;flex-direction:column;gap:10px;margin:16px 0}
+.method{border:1px solid var(--line);border-radius:8px;padding:13px 16px}
+.method-h{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.method-h code{font-size:13px}
+.method p{margin:8px 0 0;font-size:14px}
+.form{display:grid;gap:14px}
+.frow{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+label{display:block;font-size:13px;font-weight:550;color:var(--ink)}
+label small{display:block;color:var(--soft);font-weight:400;font-size:12px;margin-top:2px}
+input[type=text],input[type=password]{width:100%;margin-top:6px;padding:10px 12px;border:1px solid var(--line);border-radius:6px;font:15px/1.4 inherit;color:var(--ink);background:#fff}
+input:focus{outline:2px solid #bfe0d5;outline-offset:1px;border-color:#9dc8b8}
+.mods{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-top:8px}
+.opt{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:450;color:var(--body);border:1px solid var(--line);border-radius:6px;padding:9px 11px;cursor:pointer;background:#fff}
+.opt:hover{border-color:#cdd6dd}
+.opt input{accent-color:var(--accent);width:15px;height:15px;margin:0}
+.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+button{font:600 14px/1 inherit;border-radius:6px;padding:11px 17px;cursor:pointer;border:1px solid var(--accent);background:var(--accent);color:#fff}
+button:hover{background:var(--accent2);border-color:var(--accent2)}
+button:disabled{opacity:.55;cursor:not-allowed}
+button.ghost{background:#fff;color:var(--ink);border-color:var(--line)}
+button.ghost:hover{background:#f6f8f9;border-color:#cdd6dd}
+button.danger{background:#fff;color:var(--err);border-color:#eccfcf}
+button.danger:hover{background:#fdf5f5}
+.status{display:flex;flex-wrap:wrap;gap:10px;align-items:center;font-size:13.5px;border:1px solid var(--line);border-radius:6px;padding:11px 14px;background:#fbfcfd;margin-top:4px}
+.status .mono{font-family:var(--monospace);font-size:12.5px}
+.out{border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-top:14px}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);background:#fbfcfd;padding:0 8px;overflow-x:auto}
+.tabs button{background:none;border:0;border-bottom:2px solid transparent;color:var(--soft);font-size:13px;font-weight:550;padding:12px 10px;border-radius:0}
+.tabs button.on{color:var(--accent2);border-bottom-color:var(--accent)}
+.tabs button:hover{background:none;color:var(--ink)}
+.out pre{border:0;border-radius:0;max-height:460px;min-height:120px;display:none}
+.out pre.on{display:block}
+.placeholder{padding:28px 20px;color:var(--soft);font-size:14px;text-align:center}
+footer{border-top:1px solid var(--line);margin-top:56px;padding-top:22px;font-size:12.5px;color:var(--soft);display:flex;flex-wrap:wrap;gap:8px 20px}
+.totop{position:fixed;right:18px;bottom:18px;background:#fff;border:1px solid var(--line);border-radius:50%;width:40px;height:40px;display:none;place-items:center;color:var(--soft);box-shadow:0 2px 10px rgba(20,25,30,.07);z-index:50}
+.totop.on{display:grid}
+@media(max-width:900px){
+.layout{grid-template-columns:minmax(0,1fr);gap:0;padding:0 18px}
+aside{position:fixed;top:0;left:0;bottom:0;width:270px;max-height:none;background:#fff;border-right:1px solid var(--line);padding:22px 18px;z-index:70;transform:translateX(-100%);transition:transform .22s ease;overflow:auto}
+aside.open{transform:none}
+aside nav{border-left:0;padding-left:0}
+aside a{font-size:15px;padding:10px 0}
+.scrim{position:fixed;inset:0;background:rgba(15,20,25,.34);z-index:65;display:none}
+.scrim.on{display:block}
+.burger{display:block}
+.top-links{display:none}
+main{padding:24px 0 70px;max-width:none}
+.hero h1{font-size:27px;letter-spacing:-.7px}
+h2{font-size:20px}
+.frow{grid-template-columns:1fr}
+.brand span.txt{display:none}
+.tablewrap{border:0;overflow:visible}
+table{min-width:0;font-size:13.5px}
+thead{display:none}
+tbody tr{display:block;border:1px solid var(--line);border-radius:8px;padding:4px 0;margin-bottom:10px}
+tbody td{display:block;border:0;padding:7px 14px}
+tbody td:first-child{white-space:normal;font-size:12.5px;color:var(--accent2)}
+tbody td:first-child:before{content:attr(data-label) ": ";color:var(--soft);font-family:inherit;font-size:12px}
+tbody td:last-child{padding-top:0}
+.mods{grid-template-columns:1fr 1fr}
+.methods .method{padding:12px 14px}
+}
+@media(max-width:420px){.mods{grid-template-columns:1fr}.hero h1{font-size:24px}pre{font-size:12px;padding:13px}}
+</style>
 </head>
 <body>
-  <div class="layout">
-    <aside class="side">
-      <div class="brand">
-        <div class="brand-mark">P</div>
-        <div>
-          <strong>Pronote API</strong>
-          <span>Documentation v${VERSION}</span>
-        </div>
-      </div>
-      <nav>
-        <div class="group">Guide</div>
-        <a href="#overview">Vue d’ensemble</a>
-        <a href="#architecture">Architecture</a>
-        <a href="#auth">Authentification</a>
-        <a href="#endpoints">Endpoints</a>
-        <a href="#flow">Cycle d’une extraction</a>
-        <div class="group">Référence JSON</div>
-        <a href="#request">Corps de requête</a>
-        <a href="#response">Réponse complète</a>
-        <a href="#modules">Rubriques</a>
-        <a href="#errors">Codes d’erreur</a>
-        <a href="#limits">Limites</a>
-        <div class="group">Essai</div>
-        <a href="#playground">Playground</a>
-        <a href="#examples">Exemples curl</a>
-      </nav>
-    </aside>
+<div class="scrim" id="scrim"></div>
+<header class="topbar"><div class="topbar-in">
+<a class="brand" href="#intro"><span class="mark">P</span><span class="txt">Pronote API</span></a>
+<span class="ver">v${VERSION}</span>
+<nav class="top-links"><a href="${BASE}/docs">Worker /docs</a><a href="https://github.com/JeanHug/Pronote-API">GitHub</a></nav>
+<button class="burger" id="burger" aria-label="Ouvrir le sommaire"><span></span><span></span><span></span></button>
+</div></header>
+<div class="layout">
+<aside id="side"><nav>${nav.map(([id, label]) => `<a href="#${id}">${label}</a>`).join('')}</nav></aside>
+<main>
 
-    <div class="main">
-      <div class="top">
-        <div class="meta">
-          <span class="chip ok">v${VERSION} déployée</span>
-          <span class="chip">ENT77 · espace élève</span>
-          <span class="chip">Cloudflare Worker</span>
-        </div>
-        <div class="meta">
-          <a class="btn" href="${BASE}/docs" target="_blank" rel="noreferrer">/docs Worker</a>
-          <a class="btn" href="./schema.json" target="_blank" rel="noreferrer">schema.json</a>
-          <a class="btn primary" href="#playground">Ouvrir le playground</a>
-        </div>
-      </div>
+<div class="hero" id="intro">
+<h1>Documentation de l’API Pronote</h1>
+<p>API REST non officielle en lecture seule pour l’espace élève Pronote via l’ENT77. Chaque rubrique annonce son état réel : aucune donnée n’est inventée, aucun champ n’est deviné.</p>
+<div class="chips"><span class="chip">Version ${VERSION}</span><span class="chip">${BASE.replace('https://', '')}</span><span class="chip">8 rubriques</span><span class="chip">Lecture seule</span><span class="chip">Résultats chiffrés</span></div>
+<div class="note"><strong>Prérequis.</strong> Un identifiant et un mot de passe ENT77 que vous êtes autorisé à utiliser. L’API n’a aucun compte intégré : les identifiants sont toujours fournis par l’appelant, à chaque requête.</div>
+</div>
 
-      <div class="content">
-        <nav class="mobile-nav card" style="margin-bottom:18px">
-          <div class="modules">
-            <a class="tag" href="#overview">Vue d’ensemble</a>
-            <a class="tag" href="#endpoints">Endpoints</a>
-            <a class="tag" href="#response">JSON</a>
-            <a class="tag" href="#playground">Playground</a>
-            <a class="tag" href="#limits">Limites</a>
-          </div>
-        </nav>
+<section id="architecture">
+<h2>Architecture</h2>
+<ol>
+<li><strong>Cloudflare Worker</strong> — point d’entrée HTTP public. Validation, limitation de débit, chiffrement, documentation.</li>
+<li><strong>Durable Object <code>Coordinator</code></strong> — stockage SQLite à cohérence forte. Conserve les demandes chiffrées puis les résultats chiffrés. Un seul objet sérialise toutes les opérations d’état.</li>
+<li><strong>Moteur GitHub Actions</strong> — machine virtuelle éphémère exécutant Chromium. C’est le seul composant qui ouvre un navigateur. Elle n’expose aucun port entrant : c’est elle qui interroge le Worker.</li>
+<li><strong>Cette console</strong> — page statique sur GitHub Pages. Aucun serveur, aucune donnée stockée.</li>
+</ol>
+<p>Le Worker ne scrape jamais le site lui-même : Chromium ne peut pas s’exécuter dans un Worker. Le Durable Object reste nécessaire car la VM GitHub Actions ne peut recevoir que des connexions sortantes.</p>
+<div class="note">Cette version n’utilise pas le protocole natif de Pronote. Elle ouvre une session ENT réelle, la transfère vers un contexte Chromium isolé, puis lit les pages réellement rendues.</div>
+</section>
 
-        <header class="hero" id="overview">
-          <h1>Documentation Pronote API</h1>
-          <p>
-            API non officielle, en lecture seule, pour l’espace élève Pronote via ENT77.
-            Version <strong>${VERSION}</strong> : session ENT vérifiée, jobs chiffrés, résultats protégés par jeton,
-            et statuts de rubrique explicites. Non affiliée à Index Éducation.
-          </p>
-          <div class="hero-actions">
-            <a class="btn primary" href="#playground">Tester dans le playground</a>
-            <a class="btn" href="#response">Voir le schéma JSON</a>
-            <a class="btn" href="https://github.com/JeanHug/Pronote-API" target="_blank" rel="noreferrer">Code source</a>
-          </div>
-          <div class="grid">
-            <div class="card"><h3>Pas de compte intégré</h3><p>Les identifiants sont fournis par l’appelant. Aucun compte de démo, aucune donnée simulée.</p></div>
-            <div class="card"><h3>Portée honnête</h3><p>Les lectures portent sur les vues actuellement chargées par Pronote, pas sur une année inventée.</p></div>
-            <div class="card"><h3>Rétention courte</h3><p>Identifiants effacés à la prise en charge. Résultats chiffrés 5 minutes, accessibles seulement avec X-Job-Token.</p></div>
-          </div>
-        </header>
+<section id="auth">
+<h2>Authentification</h2>
+<h3>Identifiants ENT</h3>
+<p>Envoyez <code>username</code> et <code>password</code> dans le corps JSON de chaque extraction. Les identifiants sont chiffrés en AES-GCM dès la réception, puis <strong>supprimés dès que le moteur prend le job en charge</strong>, et au plus tard trois minutes plus tard. Ils ne sont jamais journalisés.</p>
+<h3>Clé API facultative</h3>
+<p>Si le propriétaire configure le secret <code>API_KEYS</code> (liste séparée par des virgules), chaque requête doit également porter <code>Authorization: Bearer …</code> ou <code>X-API-Key</code>. Sans ce secret, l’API accepte les identifiants de l’appelant, dans les limites décrites plus bas.</p>
+<h3>Jeton de lecture d’un résultat</h3>
+<p>La réponse <code>202</code> renvoie un <code>jobToken</code>. Il est indispensable pour lire ou supprimer le résultat. Ne l’écrivez jamais dans une URL, un journal ou un rapport public.</p>
+</section>
 
-        <section id="architecture">
-          <h2>Architecture</h2>
-          <p class="lead">Trois blocs distincts. L’application Next.js de console n’est qu’un client : elle n’extrait rien elle-même.</p>
-          <div class="two">
-            <div class="card stack">
-              <div class="kv"><b>1. Worker</b><span>Point d’entrée public Cloudflare. Valide, chiffre, crée le job, applique le rate limit, répond 200 ou 202.</span></div>
-              <div class="kv"><b>2. Durable Object</b><span><code>Coordinator</code> SQLite : file d’attente, heartbeat runner, résultats chiffrés, nettoyage minute.</span></div>
-              <div class="kv"><b>3. Runner</b><span>VM GitHub Actions + Chromium. Auth ENT réelle, cookies en mémoire, navigation séquentielle Pronote, parsing HTML.</span></div>
-            </div>
-            <div class="card">
-              <h3>Ce qui a disparu en v5</h3>
-              <div class="kvs" style="margin-top:10px">
-                <div class="kv"><b>KV Cloudflare</b><span>Supprimé.</span></div>
-                <div class="kv"><b>File GitHub Issues</b><span>Supprimée. Plus de publication de résultats scolaires sur les issues.</span></div>
-                <div class="kv"><b>Cron Worker</b><span>Supprimé. Le DO gère ses propres alarmes.</span></div>
-                <div class="kv"><b>Compte public de test</b><span>Supprimé. Aucun endpoint « tester mon compte environnement ».</span></div>
-              </div>
-            </div>
-          </div>
-        </section>
+<section id="endpoints">
+<h2>Endpoints</h2>
+<div class="methods">
+${[
+  ['GET', 'g', '/api/v1/health', 'public', 'État de la passerelle, profondeur de file et résumé assaini de la dernière extraction. N’inclut aucune donnée scolaire.'],
+  ['GET', 'g', '/api/v1/ready', 'public', 'Renvoie 200 si un moteur v5 a signalé sa présence récemment, 503 sinon. Utile avant un appel automatisé.'],
+  ['GET', 'g', '/api/v1/schema', 'public', 'Contrat machine : version, modules, accès aux jobs et rétention.'],
+  ['POST', 'b', '/api/v1/scrape-pronote', 'identifiants ENT', 'Crée une extraction. Renvoie 200 si elle aboutit dans le délai synchrone, sinon 202 avec jobId et jobToken.'],
+  ['GET', 'o', '/api/v1/job/:id', 'X-Job-Token', 'Lit un résultat. Renvoie 202 tant que le traitement est en cours.'],
+  ['DELETE', 'r', '/api/v1/job/:id', 'X-Job-Token', 'Supprime immédiatement le résultat chiffré.'],
+  ['GET', 'g', '/docs', 'public', 'Documentation servie par le Worker.'],
+].map(([m, c, p, a, d]) => `<div class="method"><div class="method-h"><span class="pill ${c}">${m}</span><code>${BASE}${p === '/docs' ? p : p}</code><span class="chip">${a}</span></div><p>${d}</p></div>`).join('')}
+</div>
+<p>Alias acceptés pour l’extraction : <code>/api/v1/scrape</code>, <code>/api/scrape-pronote</code>, <code>/api/scrape</code>. Le contrat JSON de la version ${VERSION} est une rupture par rapport aux versions antérieures.</p>
+<h3>En-têtes</h3>
+${table(['En-tête', 'Requis', 'Description'], [
+  ['Content-Type', 'POST', 'Doit valoir application/json. Sinon 415.'],
+  ['Authorization', 'si API_KEYS', 'Bearer &lt;clé&gt;. Alternative : X-API-Key.'],
+  ['X-Job-Token', 'routes job', 'Jeton de lecture du résultat, 64 caractères hexadécimaux.'],
+])}
+<h3>En-têtes de réponse</h3>
+${table(['En-tête', 'Quand', 'Description'], [
+  ['X-Job-Token', '202', 'Jeton de lecture, également présent dans le corps.'],
+  ['Retry-After', '202, 429', 'Délai conseillé en secondes avant la prochaine tentative.'],
+])}
+</section>
 
-        <section id="auth">
-          <h2>Authentification</h2>
-          <p class="lead">Deux couches distinctes : les identifiants ENT du compte à lire, et optionnellement une clé d’API pour restreindre qui peut appeler le service.</p>
-          <div class="two">
-            <div class="card">
-              <h3>Identifiants ENT (toujours)</h3>
-              <p style="color:var(--muted);margin:8px 0 0">
-                <code>username</code> + <code>password</code> dans le JSON.
-                Ils authentifient le <em>compte scolaire</em>, pas l’API.
-                Chiffrés AES-GCM au repos, purgés dès le claim du runner.
-              </p>
-            </div>
-            <div class="card">
-              <h3>Clé d’API (optionnelle)</h3>
-              <p style="color:var(--muted);margin:8px 0 0">
-                Si le secret Cloudflare <code>API_KEYS</code> est configuré, fournissez
-                <code>Authorization: Bearer …</code> ou <code>X-API-Key</code>.
-                Sinon, l’endpoint accepte les appels avec les seuls identifiants ENT, sous rate limit.
-              </p>
-            </div>
-          </div>
-          <div class="callout warn" style="margin-top:14px">
-            Le suivi d’un job n’utilise <strong>pas</strong> les identifiants ENT.
-            Il exige le <code>jobToken</code> renvoyé à la création, via l’en-tête <code>X-Job-Token</code>.
-          </div>
-        </section>
+<section id="request">
+<h2>Corps de requête</h2>
+${table(['Champ', 'Type', 'Description'], [
+  ['username', 'string · requis', 'Identifiant ENT. 200 caractères maximum.'],
+  ['password', 'string · requis', 'Mot de passe ENT. 200 caractères maximum.'],
+  ['modules', 'string[] · facultatif', 'Rubriques à extraire. Par défaut les 8. Doublons ignorés, 8 maximum.'],
+  ['pronoteUrl', 'string · facultatif', 'Espace élève HTTPS sur index-education.net, chemin exact /pronote/eleve.html, sans port, requête ni identifiant.'],
+  ['entUrl', 'string · facultatif', 'https://ent.seine-et-marne.fr/ ou https://ent77.seine-et-marne.fr/ uniquement.'],
+])}
+<details><summary>Exemple minimal</summary><div><pre><code>POST ${BASE}/api/v1/scrape-pronote
+Content-Type: application/json
 
-        <section id="endpoints">
-          <h2>Endpoints</h2>
-          <p class="lead">Base URL : <code>${API}</code></p>
-          ${fieldsTable([
-            { path: 'GET /api/v1/health', type: 'public', description: 'État de la passerelle, présence du runner, file, résumé assaini de la dernière extraction (compteurs uniquement).', example: `${API}/health` },
-            { path: 'GET /api/v1/ready', type: 'public', description: 'HTTP 200 si un runner v5 a envoyé un heartbeat récent, sinon 503.', example: `${API}/ready` },
-            { path: 'GET /api/v1/schema', type: 'public', description: 'Contrat machine : modules, rétention, portée.', example: `${API}/schema` },
-            { path: 'POST /api/v1/scrape-pronote', type: 'API_KEYS?', description: 'Crée une extraction. 200 si terminée dans ~22 s, sinon 202 + jobId/jobToken.', example: `${API}/scrape-pronote` },
-            { path: 'GET /api/v1/job/:id', type: 'X-Job-Token', description: 'Lit le résultat. 202 tant que le job tourne, 200/4xx/5xx à la fin, 404 sans jeton valide.', example: `${API}/job/{id}` },
-            { path: 'DELETE /api/v1/job/:id', type: 'X-Job-Token', description: 'Supprime immédiatement le résultat chiffré.', example: `${API}/job/{id}` },
-            { path: 'GET /docs', type: 'public', description: 'Documentation HTML servie par le Worker.', example: `${BASE}/docs` },
-          ])}
-          <p class="note" style="margin-top:10px">Alias acceptés pour l’extraction : <code>/api/v1/scrape</code>, <code>/api/scrape-pronote</code>, <code>/api/scrape</code>. Le contrat JSON reste celui de la v${VERSION}.</p>
-        </section>
+${'{\n  "username": "prenom.nom",\n  "password": "••••••••"\n}'}</code></pre></div></details>
+<details><summary>Exemple complet</summary><div><pre><code>${JSON.stringify({ username: 'prenom.nom', password: '••••••••', modules: ['emploiDuTemps', 'notes', 'agenda'], pronoteUrl: 'https://0771068t.index-education.net/pronote/eleve.html', entUrl: 'https://ent.seine-et-marne.fr/' }, null, 2)}</code></pre></div></details>
+</section>
 
-        <section id="flow">
-          <h2>Cycle d’une extraction</h2>
-          <div class="card">
-            <div class="kvs">
-              <div class="kv"><b>1. POST</b><span>Vous envoyez username/password (+ modules optionnels).</span></div>
-              <div class="kv"><b>2. Validation</b><span>JSON, longueurs, URL Pronote, ENT77, modules connus, rate limit IP.</span></div>
-              <div class="kv"><b>3. Job</b><span>UUID + jobToken. Identifiants chiffrés dans le Durable Object.</span></div>
-              <div class="kv"><b>4. Runner</b><span>Si hors ligne, démarrage GitHub Actions. Claim, purge immédiate du ciphertext d’identifiants.</span></div>
-              <div class="kv"><b>5. ENT → Pronote</b><span>Auth HTTP ENT, userinfo, cookies mémoire, Chromium isolé, navigation séquentielle des rubriques.</span></div>
-              <div class="kv"><b>6. Réponse</b><span>200 si prêt pendant l’attente synchrone, sinon 202. Puis GET /job/:id avec X-Job-Token toutes les 3 s minimum.</span></div>
-              <div class="kv"><b>7. Fin</b><span>DELETE recommandé. Sinon expiration automatique à 5 minutes.</span></div>
-            </div>
-          </div>
-        </section>
+<section id="response">
+<h2>Réponses et suivi</h2>
+<h3>Cycle d’un appel</h3>
+<ol>
+<li>Vous envoyez <code>POST /api/v1/scrape-pronote</code>.</li>
+<li>Le Worker chiffre la demande et la met en file, puis démarre un moteur si aucun n’est en ligne.</li>
+<li>Il attend jusqu’à 22 secondes. Si le résultat arrive, vous recevez directement <code>200</code> (ou <code>401</code> / <code>502</code> selon le cas).</li>
+<li>Sinon vous recevez <code>202</code> avec <code>jobId</code>, <code>jobToken</code> et <code>statusUrl</code>. <strong>Le traitement continue.</strong></li>
+<li>Vous interrogez <code>GET /api/v1/job/&lt;jobId&gt;</code> avec <code>X-Job-Token</code> toutes les 3 secondes.</li>
+<li>Dès que le statut HTTP n’est plus <code>202</code>, vous avez le résultat. Appelez <code>DELETE</code> pour l’effacer immédiatement.</li>
+</ol>
+<h3>Codes HTTP</h3>
+${table(['Code', 'Signification'], [
+  ['<span class="pill g">200</span>', 'Extraction terminée. Vérifiez status et modules[].status.'],
+  ['<span class="pill b">202</span>', 'Traitement en cours. Continuez à interroger le job.'],
+  ['<span class="pill o">400</span>', 'Requête invalide. Voir error.code.'],
+  ['<span class="pill o">401</span>', 'Identifiants ENT refusés ou espace Pronote non ouvert.'],
+  ['<span class="pill o">409</span>', 'Action requise sur le portail ENT.'],
+  ['<span class="pill o">413</span>', 'Corps trop volumineux.'],
+  ['<span class="pill o">415</span>', 'Content-Type incorrect.'],
+  ['<span class="pill o">422</span>', 'Aucune rubrique lue de façon vérifiable.'],
+  ['<span class="pill o">429</span>', 'Limite de débit atteinte. Respectez Retry-After.'],
+  ['<span class="pill r">502</span>', 'Échec amont ou moteur interrompu.'],
+  ['<span class="pill r">503</span>', 'Moteur indisponible, file pleine ou démarrage impossible.'],
+  ['<span class="pill r">504</span>', 'Délai d’extraction dépassé.'],
+])}
+<div class="note"><strong>Ne vous fiez pas seulement à <code>success</code>.</strong> Une réponse peut être <code>partial</code> : certaines rubriques sont alors <code>unavailable</code> ou <code>error</code>. Lisez toujours <code>modules[]</code>.</div>
+<details><summary>Exemple de réponse 202</summary><div><pre><code>${JSON.stringify({ version: VERSION, success: false, status: 'running', jobId: '0f0c9a1e-4b2d-4c8a-9f3e-7d5b1a6c2e40', jobToken: '•••••••••••••••••••••••••••••••••', statusUrl: '/api/v1/job/0f0c9a1e-4b2d-4c8a-9f3e-7d5b1a6c2e40', retryAfterSeconds: 3 }, null, 2)}</code></pre></div></details>
+</section>
 
-        <section id="request">
-          <h2>Corps de requête</h2>
-          <p class="lead">POST <code>${API}/scrape-pronote</code> · Content-Type <code>application/json</code> · corps ≤ 8 Kio.</p>
-          ${fieldsTable(requestFields)}
-          <div class="two" style="margin-top:16px">
-            <div>
-              <h3 style="margin:0 0 10px;font-size:15px">Exemple minimal</h3>
-              <pre>${esc(`{
-  "username": "prenom.nom",
-  "password": "votre-mot-de-passe"
-}`)}</pre>
-            </div>
-            <div>
-              <h3 style="margin:0 0 10px;font-size:15px">Exemple ciblé</h3>
-              <pre>${esc(`{
-  "username": "prenom.nom",
-  "password": "votre-mot-de-passe",
-  "modules": ["emploiDuTemps", "notes", "agenda", "ressources"],
-  "pronoteUrl": "${DEFAULT_PRONOTE}",
-  "entUrl": "${DEFAULT_ENT}"
-}`)}</pre>
-            </div>
-          </div>
-        </section>
+<section id="fields">
+<h2>Référence JSON exhaustive</h2>
+<p class="lead">Tous les champs renvoyés par la version ${VERSION}, groupés par structure. Un champ non exposé par Pronote vaut <code>null</code> : il n’est jamais rempli par une valeur supposée.</p>
+${groups.map(g => `<h3 id="${g.id}">${g.title}</h3><p>${g.intro}</p>${table(['Chemin', 'Type', 'Description'], g.rows.map(r => [esc(r[0]), esc(r[1]), esc(r[2])]))}`).join('')}
+<details><summary>Réponse complète type (données synthétiques)</summary><div><pre><code>${JSON.stringify(example, null, 2)}</code></pre></div></details>
+</section>
 
-        <section id="response">
-          <h2>Réponse JSON exhaustive</h2>
-          <p class="lead">
-            Liste complète des chemins renvoyés par la v${VERSION}.
-            <code>null</code> signifie « non exposé », jamais une valeur inventée.
-            Une rubrique absente du menu vaut <code>unavailable</code>, pas un tableau vide feint.
-          </p>
-          ${fieldsTable(responseFields)}
-          <h3 style="margin:22px 0 10px;font-size:16px">Exemple de réponse 200</h3>
-          <pre>${esc(JSON.stringify(exampleResponse, null, 2))}</pre>
-          <h3 style="margin:22px 0 10px;font-size:16px">Exemple de réponse 202</h3>
-          <pre>${esc(JSON.stringify({
-            version: VERSION,
-            success: false,
-            status: 'running',
-            jobId: '3f8a2c10-9b4e-4a7d-8c1f-2e5b9d0a7c34',
-            jobToken: '…64 hex chars…',
-            statusUrl: '/api/v1/job/3f8a2c10-9b4e-4a7d-8c1f-2e5b9d0a7c34',
-            error: {
-              code: 'TIMEOUT',
-              message: 'Extraction encore en cours. Interrogez statusUrl avec X-Job-Token.',
-              stage: 'runner',
-            },
-          }, null, 2))}</pre>
-        </section>
+<section id="modules">
+<h2>Rubriques</h2>
+${table(['Module', 'Portée réelle', 'Description'], MODULES.map(m => [esc(m), esc(moduleScope[m]), esc(moduleLabel[m])]).concat([['(liste complète)', '—', 'Passez modules pour restreindre l’extraction.']]))}
+<h3>Codes de niveau rubrique</h3>
+${table(['Code', 'Signification'], moduleCodes.map(c => [esc(c[0]), esc(c[1])]))}
+</section>
 
-        <section id="modules">
-          <h2>Rubriques</h2>
-          <p class="lead">Huit modules. Demandez uniquement ce dont vous avez besoin pour réduire la durée.</p>
-          <div class="modules" style="margin-bottom:14px">
-            ${MODULES.map((m) => `<span class="tag"><code>${m}</code></span>`).join('')}
-          </div>
-          ${fieldsTable([
-            { path: 'emploiDuTemps', type: 'module', description: 'Semaine actuellement affichée par Pronote. Créneaux avec matière, horaires, salle/prof si reconnus.', example: 'scope: Semaine affichée par Pronote' },
-            { path: 'notes', type: 'module', description: 'Période sélectionnée. Coefficients et barèmes conservés seulement s’ils sont exposés.', example: 'scope: Période sélectionnée par Pronote' },
-            { path: 'agenda', type: 'module', description: 'Travail à faire chargé dans la vue courante, avec état fait/non fait si disponible.', example: 'scope: Travail à faire chargé dans la vue Pronote' },
-            { path: 'ressources', type: 'module', description: 'Contenus et ressources, y compris séances sans pièce jointe.', example: 'scope: Séances chargées dans la vue Pronote' },
-            { path: 'vieScolaire', type: 'module', description: 'Carnet / absences si le menu existe. Sinon unavailable.', example: 'elements[].texte' },
-            { path: 'competences', type: 'module', description: 'Évaluations de compétences affichées, texte libre structuré.', example: 'elements[].texte' },
-            { path: 'actualites', type: 'module', description: 'Informations & sondages en lecture seule, sans marquage de lecture.', example: 'elements[].texte' },
-            { path: 'cantine', type: 'module', description: 'Menus si le compte expose la rubrique. Souvent unavailable.', example: 'TAB_UNAVAILABLE possible' },
-          ])}
-        </section>
+<section id="errors">
+<h2>Codes d’erreur</h2>
+${table(['Code', 'HTTP', 'Signification'], errorCodes.map(c => [`<span class="anchor"><span class="pill n">${esc(c[1])}</span>${esc(c[0])}</span>`, esc(c[1]), esc(c[2])]))}
+<div class="warn"><strong>Aucun détail de session n’est divulgué.</strong> Les messages d’erreur ne contiennent jamais d’identifiant, de mot de passe, de cookie ni d’URL de session. Certaines URL de pièces jointes sont volontairement mises à <code>null</code>.</div>
+</section>
 
-        <section id="errors">
-          <h2>Codes d’erreur</h2>
-          <p class="lead">Les messages publics ne contiennent jamais le mot de passe, le cookie ou un extrait de session.</p>
-          ${fieldsTable(errors.map((e) => ({
-            path: e.code,
-            type: `HTTP ${e.http}`,
-            description: e.meaning,
-          })))}
-        </section>
+<section id="limits">
+<h2>Limites et rétention</h2>
+${table(['Sujet', 'Limite', 'Comportement'], limits.map(l => [esc(l[0]), esc(l[1]), esc(l[2])]))}
+<h3>Éléments retirés par rapport aux versions antérieures</h3>
+<ul>
+<li>Cloudflare KV, cron Worker et file d’attente par issue GitHub.</li>
+<li>Publication de réponses ou d’identifiants dans les issues.</li>
+<li>Endpoints internes non authentifiés et compte de démonstration public.</li>
+</ul>
+<h3>Limites fonctionnelles assumées</h3>
+<ul>
+<li>Connexion locale ENT77 et espace <strong>élève</strong> uniquement. EduConnect, double authentification ou action obligatoire renvoient une erreur explicite : ces contrôles ne sont jamais contournés.</li>
+<li>Lecture limitée aux vues réellement chargées : la semaine affichée, la période sélectionnée. Ce n’est pas une garantie de l’année scolaire complète.</li>
+<li><code>data.eleve</code> décrit le titulaire du compte ENT, pas nécessairement l’élève si le compte est un compte parent ou personnel.</li>
+<li>Aucune écriture : pas de devoir marqué fait, pas de message marqué lu, aucun paramètre modifié.</li>
+<li>Une rotation de moteur peut entraîner un démarrage à froid de quelques minutes.</li>
+</ul>
+</section>
 
-        <section id="limits">
-          <h2>Limites</h2>
-          ${fieldsTable([
-            { path: 'Débit', type: '5 / min / IP', description: 'Fenêtre fixe de 60 s. 429 + Retry-After au-delà.' },
-            { path: 'File', type: '12 jobs actifs', description: '503 QUEUE_FULL si saturée.' },
-            { path: 'Corps requête', type: '8 Kio', description: '413 BODY_TOO_LARGE.' },
-            { path: 'Résultat runner', type: '2 Mio', description: '413 si dépassé.' },
-            { path: 'Identifiants', type: '200 caractères', description: 'Chacun. 400 INVALID_REQUEST sinon.' },
-            { path: 'Attente synchrone', type: '≈ 22 s', description: 'Puis 202 + jobId/jobToken.' },
-            { path: 'Extraction totale', type: '150 s', description: '504 EXTRACTION_TIMEOUT.' },
-            { path: 'Identifiants chiffrés', type: 'jusqu’au claim', description: 'Deadline 3 minutes si jamais pris.' },
-            { path: 'Bail runner', type: '3 minutes', description: 'Job interrompu → échec explicite, pas de rejeu silencieux.' },
-            { path: 'Résultats', type: '5 minutes', description: 'AES-GCM + X-Job-Token. DELETE pour purge immédiate.' },
-            { path: 'Runner', type: '260 / 300 min', description: 'Service GitHub Actions avec relève anticipée.' },
-            { path: 'Heartbeat', type: '65 s', description: 'Au-delà, ready repasse à 503.' },
-          ])}
-          <div class="callout" style="margin-top:14px">
-            L’identité <code>data.eleve</code> provient de la session ENT (titulaire du compte).
-            Les contenus scolaires (emploi du temps, notes, devoirs, ressources…) proviennent de l’espace élève Pronote réellement ouvert.
-          </div>
-        </section>
+<section id="playground">
+<h2>Playground</h2>
+<p class="lead">Exécutez une extraction réelle depuis votre navigateur. Les identifiants partent directement de cet onglet vers le Worker, sans passer par un autre serveur, et ne sont jamais stockés ici.</p>
+<div class="warn"><strong>Attention.</strong> Le résultat contient des données scolaires réelles. Il reste accessible avec le jeton pendant cinq minutes. Utilisez le bouton de suppression dès que vous avez terminé, et n’entrez que des identifiants que vous êtes autorisé à utiliser.</div>
+<form class="form" id="pg" autocomplete="off">
+<div class="frow">
+<label>Identifiant ENT<input type="text" id="u" placeholder="prenom.nom" autocomplete="off" spellcheck="false"></label>
+<label>Mot de passe<input type="password" id="p" placeholder="••••••••" autocomplete="new-password"></label>
+</div>
+<div class="frow">
+<label>Clé API <small>laisser vide si non configurée</small><input type="password" id="k" placeholder="facultatif" autocomplete="off"></label>
+<label>pronoteUrl <small>facultatif</small><input type="text" id="pu" placeholder="https://…/pronote/eleve.html" spellcheck="false"></label>
+</div>
+<div>
+<label>Rubriques <small>toutes par défaut</small></label>
+<div class="mods" id="mods">${MODULES.map(m => `<label class="opt"><input type="checkbox" value="${m}" checked>${moduleLabel[m]}</label>`).join('')}</div>
+</div>
+<div class="actions">
+<button type="submit" id="go">Exécuter</button>
+<button type="button" class="ghost" id="stop" disabled>Arrêter</button>
+<button type="button" class="ghost" id="clear">Effacer</button>
+</div>
+</form>
+<div class="status" id="status" hidden><span class="mono" id="st-code">—</span><span id="st-text">Prêt.</span><span class="mono" id="st-time" style="margin-left:auto"></span></div>
+<div class="out" id="out" hidden>
+<div class="tabs" id="tabs">
+<button class="on" data-t="r">Réponse</button>
+<button data-t="c">cURL</button>
+<button data-t="j">JavaScript</button>
+</div>
+<pre class="on" data-p="r"><div class="placeholder">Aucune réponse pour le moment.</div></pre>
+<pre data-p="c"></pre>
+<pre data-p="j"></pre>
+</div>
+</section>
 
-        <section id="playground">
-          <h2>Playground</h2>
-          <p class="lead">
-            Console complète contre l’API déployée. Les identifiants restent dans votre navigateur le temps de l’appel,
-            transitent vers le Worker, et ne sont jamais écrits dans cette page statique.
-            En cas de 202, le suivi utilise uniquement <code>X-Job-Token</code>.
-          </p>
-          <div class="playground">
-            <div class="playground-grid">
-              <form class="play-form" id="play-form">
-                <div class="field">
-                  <label for="baseUrl">Base URL</label>
-                  <input id="baseUrl" name="baseUrl" type="url" value="${API}" />
-                </div>
-                <div class="field">
-                  <label for="username">Identifiant ENT</label>
-                  <input id="username" name="username" type="text" autocomplete="username" required maxlength="200" placeholder="prenom.nom" />
-                </div>
-                <div class="field">
-                  <label for="password">Mot de passe ENT</label>
-                  <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="200" placeholder="••••••••" />
-                  <div class="help">Effacé du formulaire juste après l’envoi.</div>
-                </div>
-                <div class="field">
-                  <label for="apiKey">Clé d’API (optionnelle)</label>
-                  <input id="apiKey" name="apiKey" type="password" autocomplete="off" placeholder="Si API_KEYS est configuré" />
-                </div>
-                <div class="field">
-                  <label>Rubriques</label>
-                  <div class="checkboxes" id="module-list">
-                    ${MODULES.map((m, i) => `<label class="check"><input type="checkbox" name="modules" value="${m}" ${i < 4 ? 'checked' : ''}/>${m}</label>`).join('')}
-                  </div>
-                </div>
-                <div class="field">
-                  <label for="pronoteUrl">pronoteUrl (optionnel)</label>
-                  <input id="pronoteUrl" name="pronoteUrl" type="url" value="${DEFAULT_PRONOTE}" />
-                </div>
-                <div class="field">
-                  <label for="entUrl">entUrl (optionnel)</label>
-                  <input id="entUrl" name="entUrl" type="url" value="${DEFAULT_ENT}" />
-                </div>
-                <div class="row">
-                  <button class="btn primary" type="submit" id="run-btn">Lancer l’extraction</button>
-                  <button class="btn" type="button" id="stop-btn" disabled>Arrêter le suivi</button>
-                  <button class="btn" type="button" id="clear-btn">Effacer</button>
-                </div>
-                <div class="help" style="margin-top:12px">
-                  Astuce : copiez la réponse, puis DELETE le job si un <code>jobId</code> est présent.
-                </div>
-              </form>
-              <div class="play-result">
-                <div class="status-line" id="status-line"><span class="dot"></span><span id="status-text">En attente d’une requête.</span></div>
-                <div class="row" style="margin-bottom:12px">
-                  <button class="btn" type="button" id="copy-btn">Copier JSON</button>
-                  <button class="btn" type="button" id="delete-btn" disabled>DELETE le job</button>
-                </div>
-                <pre class="play-output" id="output">{
-  "message": "Le résultat de l’API apparaîtra ici."
-}</pre>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section id="examples">
-          <h2>Exemples curl</h2>
-          <div class="stack">
-            <div>
-              <h3 style="margin:0 0 8px;font-size:15px">Extraction</h3>
-              <pre>${esc(`curl -sS -X POST "${API}/scrape-pronote" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "username": "prenom.nom",
-    "password": "votre-mot-de-passe",
-    "modules": ["emploiDuTemps","notes","agenda","ressources"]
-  }'`)}</pre>
-            </div>
-            <div>
-              <h3 style="margin:0 0 8px;font-size:15px">Suivi d’un job 202</h3>
-              <pre>${esc(`curl -sS "${API}/job/JOB_ID" \\
-  -H "X-Job-Token: JOB_TOKEN"`)}</pre>
-            </div>
-            <div>
-              <h3 style="margin:0 0 8px;font-size:15px">Suppression</h3>
-              <pre>${esc(`curl -sS -X DELETE "${API}/job/JOB_ID" \\
-  -H "X-Job-Token: JOB_TOKEN"`)}</pre>
-            </div>
-          </div>
-        </section>
-
-        <footer class="footer">
-          <span>Pronote API v${VERSION} · documentation générée depuis le dépôt · non affiliée à Index Éducation</span>
-          <span>Utiliser uniquement les comptes que vous êtes autorisé à consulter.</span>
-        </footer>
-      </div>
-    </div>
-  </div>
-
-  <script>
-  (() => {
-    const form = document.getElementById('play-form');
-    const output = document.getElementById('output');
-    const statusLine = document.getElementById('status-line');
-    const statusText = document.getElementById('status-text');
-    const runBtn = document.getElementById('run-btn');
-    const stopBtn = document.getElementById('stop-btn');
-    const clearBtn = document.getElementById('clear-btn');
-    const copyBtn = document.getElementById('copy-btn');
-    const deleteBtn = document.getElementById('delete-btn');
-    const passwordInput = document.getElementById('password');
-    let controller = null;
-    let lastJob = null;
-    let lastPayload = null;
-
-    function setStatus(kind, text) {
-      statusLine.className = 'status-line' + (kind ? ' ' + kind : '');
-      statusText.textContent = text;
-    }
-    function show(value) {
-      lastPayload = value;
-      output.textContent = JSON.stringify(value, null, 2);
-    }
-    function headers(apiKey, jobToken) {
-      const h = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
-      if (apiKey) h['Authorization'] = 'Bearer ' + apiKey;
-      if (jobToken) h['X-Job-Token'] = jobToken;
-      return h;
-    }
-    function sleep(ms, signal) {
-      return new Promise((resolve, reject) => {
-        const t = setTimeout(resolve, ms);
-        signal.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('Aborted', 'AbortError')); }, { once: true });
-      });
-    }
-
-    form.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      if (controller) controller.abort();
-      controller = new AbortController();
-      stopBtn.disabled = false;
-      runBtn.disabled = true;
-      deleteBtn.disabled = true;
-      lastJob = null;
-      const data = new FormData(form);
-      const base = String(data.get('baseUrl') || '').replace(/\\/$/, '');
-      const apiKey = String(data.get('apiKey') || '');
-      const modules = data.getAll('modules').map(String);
-      if (!modules.length) {
-        setStatus('err', 'Sélectionnez au moins une rubrique.');
-        runBtn.disabled = false;
-        stopBtn.disabled = true;
-        return;
-      }
-      const body = {
-        username: String(data.get('username') || ''),
-        password: String(data.get('password') || ''),
-        modules,
-      };
-      const pronoteUrl = String(data.get('pronoteUrl') || '').trim();
-      const entUrl = String(data.get('entUrl') || '').trim();
-      if (pronoteUrl) body.pronoteUrl = pronoteUrl;
-      if (entUrl) body.entUrl = entUrl;
-      passwordInput.value = '';
-      setStatus('run', 'Envoi de la requête…');
-      try {
-        let response = await fetch(base + '/scrape-pronote', {
-          method: 'POST',
-          headers: headers(apiKey),
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
-        let payload = await response.json();
-        if (payload.jobId && payload.jobToken) {
-          lastJob = { id: payload.jobId, token: payload.jobToken, base, apiKey };
-          deleteBtn.disabled = false;
-        }
-        let guard = 0;
-        while (response.status === 202 && lastJob && guard < 80) {
-          guard += 1;
-          setStatus('run', 'Extraction en cours (HTTP 202) · interrogation ' + guard + '…');
-          show(payload);
-          await sleep(3000, controller.signal);
-          response = await fetch(lastJob.base + '/job/' + encodeURIComponent(lastJob.id), {
-            headers: headers(lastJob.apiKey, lastJob.token),
-            signal: controller.signal,
-            cache: 'no-store',
-          });
-          payload = await response.json();
-        }
-        show(payload);
-        if (response.ok && payload.success) setStatus('ok', 'Extraction terminée · HTTP ' + response.status + (payload.status ? ' · ' + payload.status : ''));
-        else setStatus('err', 'Terminé avec erreur ou sans succès · HTTP ' + response.status + (payload.error && payload.error.code ? ' · ' + payload.error.code : ''));
-      } catch (error) {
-        if (error && error.name === 'AbortError') setStatus('err', 'Suivi arrêté.');
-        else setStatus('err', 'Échec réseau ou CORS. Si vous êtes sur un autre domaine, appelez l’API depuis un backend ou activez ALLOWED_ORIGINS.');
-        show({ success: false, error: { code: 'PLAYGROUND_ERROR', message: 'Requête interrompue ou refusée par le navigateur.' } });
-      } finally {
-        runBtn.disabled = false;
-        stopBtn.disabled = true;
-        controller = null;
-      }
-    });
-
-    stopBtn.addEventListener('click', () => { if (controller) controller.abort(); });
-    clearBtn.addEventListener('click', () => {
-      if (controller) controller.abort();
-      lastJob = null; lastPayload = null; deleteBtn.disabled = true;
-      show({ message: 'Le résultat de l’API apparaîtra ici.' });
-      setStatus('', 'En attente d’une requête.');
-    });
-    copyBtn.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(output.textContent || '');
-        setStatus('ok', 'JSON copié dans le presse-papiers.');
-      } catch {
-        setStatus('err', 'Copie impossible dans ce navigateur.');
-      }
-    });
-    deleteBtn.addEventListener('click', async () => {
-      if (!lastJob) return;
-      deleteBtn.disabled = true;
-      try {
-        const response = await fetch(lastJob.base + '/job/' + encodeURIComponent(lastJob.id), {
-          method: 'DELETE',
-          headers: headers(lastJob.apiKey, lastJob.token),
-        });
-        const payload = await response.json();
-        show(payload);
-        setStatus(response.ok ? 'ok' : 'err', response.ok ? 'Job supprimé côté serveur.' : 'Suppression refusée.');
-        if (response.ok) lastJob = null;
-        else deleteBtn.disabled = false;
-      } catch {
-        deleteBtn.disabled = false;
-        setStatus('err', 'Suppression impossible (réseau/CORS).');
-      }
-    });
-  })();
-  </script>
+<footer>
+<span>Pronote API ${VERSION} — documentation générée depuis le code source</span>
+<span><a href="${PAGES}schema.json">schema.json</a></span>
+<span><a href="${BASE}/docs">Worker /docs</a></span>
+<span><a href="https://github.com/JeanHug/Pronote-API">Dépôt GitHub</a></span>
+<span>Non affiliée à Index Éducation</span>
+</footer>
+</main>
+</div>
+<a class="totop" id="totop" href="#intro" aria-label="Revenir en haut">↑</a>
+<script>
+${playgroundScript}
+</script>
 </body>
 </html>`;
 
-const schema = {
-  version: VERSION,
-  baseUrl: API,
-  documentation: 'https://jeanhug.github.io/Pronote-API/',
-  workerDocs: `${BASE}/docs`,
-  authentication: {
-    entCredentials: 'Toujours fournis par le client dans le JSON (username, password).',
-    apiKeys: 'Optionnel via secret Cloudflare API_KEYS (Authorization Bearer ou X-API-Key).',
-    jobToken: 'Obligatoire pour GET/DELETE /api/v1/job/:id via X-Job-Token.',
-  },
-  endpoints: [
-    { method: 'GET', path: '/api/v1/health', auth: 'public' },
-    { method: 'GET', path: '/api/v1/ready', auth: 'public' },
-    { method: 'GET', path: '/api/v1/schema', auth: 'public' },
-    { method: 'POST', path: '/api/v1/scrape-pronote', auth: 'API_KEYS si configuré' },
-    { method: 'GET', path: '/api/v1/job/:id', auth: 'X-Job-Token' },
-    { method: 'DELETE', path: '/api/v1/job/:id', auth: 'X-Job-Token' },
-  ],
-  requestFields,
-  responseFields,
-  modules: MODULES,
-  errors,
-  exampleResponse,
-  defaults: { pronoteUrl: DEFAULT_PRONOTE, entUrl: DEFAULT_ENT },
-};
-
 async function main() {
   await mkdir('docs', { recursive: true });
-  await writeFile('docs/index.html', html, 'utf8');
+  await writeFile('docs/index.html', page, 'utf8');
   await writeFile('docs/.nojekyll', '', 'utf8');
-  await writeFile('docs/schema.json', JSON.stringify(schema, null, 2), 'utf8');
-  // Keep Worker /docs visually aligned with the public documentation.
-  await writeFile(
-    'worker/docs.ts',
-    `export const documentation = ${JSON.stringify(html)} as string;\n`,
-    'utf8',
-  );
-  console.log(JSON.stringify({
-    generated: true,
+  await writeFile('docs/schema.json', JSON.stringify({
     version: VERSION,
-    files: ['docs/index.html', 'docs/schema.json', 'docs/.nojekyll', 'worker/docs.ts'],
-    responseFields: responseFields.length,
-    requestFields: requestFields.length,
-    errors: errors.length,
-  }));
+    baseUrl: `${BASE}/api/v1`,
+    documentation: PAGES,
+    playground: `${PAGES}#playground`,
+    endpoints: [
+      { method: 'GET', path: '/api/v1/health', auth: 'public', description: 'État de la passerelle et résumé assaini.' },
+      { method: 'GET', path: '/api/v1/ready', auth: 'public', description: '503 si aucun moteur récent.' },
+      { method: 'GET', path: '/api/v1/schema', auth: 'public', description: 'Contrat machine.' },
+      { method: 'POST', path: '/api/v1/scrape-pronote', auth: 'identifiants ENT, API_KEYS si configuré', description: 'Crée une extraction. 200 ou 202 avec jobId et jobToken.' },
+      { method: 'GET', path: '/api/v1/job/:id', auth: 'X-Job-Token', description: 'Lit un résultat.' },
+      { method: 'DELETE', path: '/api/v1/job/:id', auth: 'X-Job-Token', description: 'Supprime immédiatement un résultat.' },
+    ],
+    request: {
+      username: 'string, requis, 200 caractères maximum',
+      password: 'string, requis, 200 caractères maximum',
+      modules: 'string[], facultatif, 8 rubriques maximum, doublons ignorés',
+      pronoteUrl: 'string, facultatif, espace élève HTTPS sur index-education.net',
+      entUrl: 'string, facultatif, ENT77 uniquement',
+    },
+    modules: MODULES.map(m => ({ module: m, label: moduleLabel[m], scope: moduleScope[m] })),
+    fields: groups.map(g => ({ group: g.title, fields: g.rows.map(r => ({ path: r[0], type: r[1], description: r[2] })) })),
+    errorCodes: errorCodes.map(c => ({ code: c[0], http: Number(c[1]), description: c[2] })),
+    moduleCodes: moduleCodes.map(c => ({ code: c[0], description: c[1] })),
+    limits: limits.map(l => ({ topic: l[0], value: l[1], behavior: l[2] })),
+    example,
+    retired: [
+      'Cloudflare KV, cron Worker et file d’attente par issue GitHub',
+      'Publication de réponses ou d’identifiants dans les issues',
+      'Endpoints runner non authentifiés et compte de démonstration public',
+    ],
+  }, null, 2), 'utf8');
+  console.log(JSON.stringify({ generated: true, version: VERSION, groups: groups.length, fields: groups.reduce((n, g) => n + g.rows.length, 0), errorCodes: errorCodes.length, limits: limits.length }));
 }
-
-main().catch(() => {
-  console.error('DOCS_BUILD_FAILED');
-  process.exitCode = 1;
-});
+main().catch(() => { console.error('DOCS_BUILD_FAILED'); process.exitCode = 1; });
