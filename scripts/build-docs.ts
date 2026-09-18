@@ -199,6 +199,7 @@ const limits: [topic: string, value: string, behavior: string][] = [
   ['Suivi recommandé', 'Toutes les 3 secondes', 'Arrêtez dès que le statut HTTP n’est plus 202.'],
   ['Nettoyage', 'Chaque minute', 'Alarme du Durable Object. Aucun cron Worker.'],
   ['Rubriques', '8 modules', 'Statuts ok, empty, unavailable ou error.'],
+  ['Origines (CORS)', 'Toutes, sans exception', 'Access-Control-Allow-Origin: * sur toutes les routes publiques. Aucun cookie, aucun Access-Control-Allow-Credentials.'],
 ];
 
 const moduleScope: Record<ModuleName, string> = {
@@ -427,11 +428,11 @@ tbody td:last-child{padding-top:0}
 <p>Envoyez <code>username</code> et <code>password</code> dans le corps JSON de chaque extraction. Les identifiants sont chiffrés en AES-GCM dès la réception, puis <strong>supprimés dès que le moteur prend le job en charge</strong>, et au plus tard trois minutes plus tard. Ils ne sont jamais journalisés.</p>
 <h3>Clé API facultative</h3>
 <p>Si le propriétaire configure le secret <code>API_KEYS</code> (liste séparée par des virgules), chaque requête doit également porter <code>Authorization: Bearer …</code> ou <code>X-API-Key</code>. Sans ce secret, l’API accepte les identifiants de l’appelant, dans les limites décrites plus bas.</p>
-<h3>CORS public — toutes les origines</h3>
-<p>Toutes les réponses publiques portent <code>Access-Control-Allow-Origin: *</code>. Une application hébergée sur n’importe quel domaine, sur localhost ou ouverte comme application web peut donc appeler l’API directement depuis le navigateur. Les prérequêtes autorisent <code>GET</code>, <code>POST</code>, <code>DELETE</code> et les en-têtes <code>Content-Type</code>, <code>Authorization</code>, <code>X-API-Key</code> et <code>X-Job-Token</code>.</p>
-<div class="note"><strong>CORS public ne signifie pas résultat public.</strong> L’API n’utilise pas de cookie navigateur comme authentification ambiante et ne renvoie pas <code>Access-Control-Allow-Credentials</code>. Une clé API reste exigée si <code>API_KEYS</code> est configuré, et chaque résultat exige son <code>X-Job-Token</code> aléatoire.</div>
 <h3>Jeton de lecture d’un résultat</h3>
 <p>La réponse <code>202</code> renvoie un <code>jobToken</code>. Il est indispensable pour lire ou supprimer le résultat. Ne l’écrivez jamais dans une URL, un journal ou un rapport public.</p>
+<h3>Origines autorisées (CORS)</h3>
+<p>L’API est <strong>ouverte à toutes les origines</strong>. Chaque route publique renvoie <code>Access-Control-Allow-Origin: *</code>, sans exception : n’importe quel site, page ou application peut l’appeler directement depuis un navigateur, sans configuration préalable.</p>
+<div class="note">Cette ouverture est sûre ici parce que <strong>aucun cookie n’est utilisé</strong> et que <code>Access-Control-Allow-Credentials</code> n’est jamais émis. Chaque requête transporte ses propres identifiants et ne reçoit que sa propre réponse : il n’existe aucune autorité ambiante à emprunter. La protection repose sur les identifiants, la clé API facultative, le jeton de lecture et les limites de débit — pas sur une liste d’origines.</div>
 </section>
 
 <section id="endpoints">
@@ -607,14 +608,6 @@ async function main() {
     baseUrl: `${BASE}/api/v1`,
     documentation: PAGES,
     playground: `${PAGES}#playground`,
-    cors: {
-      allowedOrigins: '*',
-      allowCredentials: false,
-      methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-      requestHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Job-Token'],
-      exposedResponseHeaders: ['X-Job-Token', 'Retry-After'],
-      maxAgeSeconds: 86400,
-    },
     endpoints: [
       { method: 'GET', path: '/api/v1/health', auth: 'public', description: 'État de la passerelle et résumé assaini.' },
       { method: 'GET', path: '/api/v1/ready', auth: 'public', description: '503 si aucun moteur récent.' },
