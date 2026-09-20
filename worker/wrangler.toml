@@ -10,11 +10,8 @@ tsconfig = "tsconfig.json"
 [vars]
 GITHUB_OWNER = "JeanHug"
 GITHUB_REPO = "Pronote-API"
-# Open API. The Worker answers `Access-Control-Allow-Origin: *` on every
-# public route, so any website, page or application can call it from a
-# browser. Credentials are sent as JSON fields, never as cookies, so no
-# `Access-Control-Allow-Credentials` is emitted and `*` is safe here.
-# This variable is kept for compatibility; the code no longer restricts origins.
+# Informational source-of-truth flag: the Worker emits
+# Access-Control-Allow-Origin: * for every public response.
 ALLOWED_ORIGINS = "*"
 
 [[durable_objects.bindings]]

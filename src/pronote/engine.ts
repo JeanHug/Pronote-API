@@ -1,11 +1,57 @@
-import puppeteer, { type Browser, type Page } from 'puppeteer';
+import puppeteer, { type Browser, type BrowserContext, type Page } from 'puppeteer';
 import { CookieJar } from 'tough-cookie';
-import { ApiError, assertNoCredentials, emptyData, safeFailure, VERSION, type Credentials, type ExtractionResult, type ModuleName, type ModuleReport, type Person } from './contracts';
+import { ApiError, assertNoCredentials, emptyData, safeFailure, VERSION, type Credentials, type ExtractionResult, type ModuleName, type ModuleReport, type Person, type PronoteData } from './contracts';
 import { parseTimetable, parseGrades, parseAssignments, parseResources, parseEntries } from './parsers';
 
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
+const EMPTY_HINT = 'aucun(?:e)? (?:note|devoir|travail|cours|absence|retard|punition|sanction|evaluation|évaluation|information|menu|element|élément)|pas de (?:note|travail|cours|devoir)|aucun element|aucun élément';
+const CORE: ModuleName[] = ['emploiDuTemps', 'notes', 'agenda', 'ressources'];
 const allowedHost = (host: string) => host === 'ent.seine-et-marne.fr' || host === 'ent77.seine-et-marne.fr' || /^[a-z0-9-]+\.index-education\.net$/i.test(host);
-const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+const navigation: Record<ModuleName, { parent: string[]; sub: string[]; selector: string; scope: string }> = {
+  emploiDuTemps: { parent: ['Vie scolaire', 'Emploi du temps'], sub: ['Emploi du temps'], selector: '.cours-simple', scope: 'Semaine affichée par Pronote' },
+  notes: { parent: ['Notes'], sub: ['Mes notes'], selector: '.note-devoir', scope: 'Période sélectionnée par Pronote' },
+  agenda: { parent: ['Cahier de textes'], sub: ['Travail à faire'], selector: '.conteneur-item .titre-matiere', scope: 'Travail à faire chargé dans la vue Pronote' },
+  ressources: { parent: ['Cahier de textes'], sub: ['Contenus et ressources'], selector: '.conteneur-item', scope: 'Séances chargées dans la vue Pronote' },
+  vieScolaire: { parent: ['Vie scolaire'], sub: ['Carnet', 'Absences'], selector: '.liste_contenu_cellule_contenu,.conteneur-item', scope: 'Carnet affiché par Pronote' },
+  competences: { parent: ['Compétences'], sub: ['Mes évaluations'], selector: '.liste_contenu_cellule_contenu,.conteneur-item', scope: 'Évaluations affichées par Pronote' },
+  actualites: { parent: ['Communication'], sub: ['Informations & sondages', 'Informations et sondages'], selector: '.conteneur-item,.liste_contenu_cellule_contenu', scope: 'Liste des informations, sans marquage de lecture' },
+  cantine: { parent: ['Vie scolaire', 'Informations personnelles'], sub: ['Menus', 'Menu de la cantine'], selector: '.conteneur-item,[class*="menu-repas"]', scope: 'Menus affichés par Pronote' },
+};
+
+let sharedBrowser: Browser | undefined;
+let sharedBrowserAt = 0;
+
+export async function closeSharedBrowser(): Promise<void> {
+  const current = sharedBrowser;
+  sharedBrowser = undefined;
+  sharedBrowserAt = 0;
+  await current?.close().catch(() => {});
+}
+
+async function ensureBrowser(): Promise<Browser> {
+  if (sharedBrowser && Date.now() - sharedBrowserAt < 25 * 60_000) {
+    try {
+      await sharedBrowser.pages();
+      return sharedBrowser;
+    } catch { await closeSharedBrowser(); }
+  }
+  sharedBrowser = await puppeteer.launch({
+    headless: true,
+    timeout: 12000,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--mute-audio', '--no-first-run'],
+    defaultViewport: { width: 1280, height: 900 },
+  });
+  sharedBrowserAt = Date.now();
+  return sharedBrowser;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    promise.then(value => { clearTimeout(timer); resolve(value); }, () => { clearTimeout(timer); resolve(fallback); });
+  });
+}
 
 async function authenticate(input: Credentials, signal: AbortSignal) {
   const jar = new CookieJar();
@@ -16,7 +62,7 @@ async function authenticate(input: Credentials, signal: AbortSignal) {
       const headers = new Headers(init.headers);
       headers.set('User-Agent', UA);
       headers.set('Cookie', await jar.getCookieString(url));
-      const response = await fetch(url, { ...init, headers, redirect: 'manual', signal: AbortSignal.any([signal, AbortSignal.timeout(20000)]) });
+      const response = await fetch(url, { ...init, headers, redirect: 'manual', signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]) });
       for (const cookie of response.headers.getSetCookie()) await jar.setCookie(cookie, url);
       const location = response.headers.get('location');
       if (location && response.status >= 300 && response.status < 400) {
@@ -46,20 +92,51 @@ async function authenticate(input: Credentials, signal: AbortSignal) {
   if (user.forceChangePassword || user.needRevalidateTerms) throw new ApiError('ENT_ACTION_REQUIRED', 409, 'ent', 'Une action est requise sur le portail ENT : mot de passe ou conditions d’utilisation.');
   const firstName = typeof user.firstName === 'string' ? user.firstName : '';
   const lastName = typeof user.lastName === 'string' ? user.lastName : '';
-  const person: Person = { nomComplet: `${firstName} ${lastName}`.trim(), prenom: firstName, nom: lastName, classe: Array.isArray(user.classNames) && typeof user.classNames[0] === 'string' ? user.classNames[0] : null, etablissement: Array.isArray(user.structureNames) && typeof user.structureNames[0] === 'string' ? user.structureNames[0] : null };
-  return { jar, person };
+  return {
+    jar,
+    person: {
+      nomComplet: `${firstName} ${lastName}`.trim(),
+      prenom: firstName,
+      nom: lastName,
+      classe: Array.isArray(user.classNames) && typeof user.classNames[0] === 'string' ? user.classNames[0] : null,
+      etablissement: Array.isArray(user.structureNames) && typeof user.structureNames[0] === 'string' ? user.structureNames[0] : null,
+    } satisfies Person,
+  };
 }
 
-const navigation: Record<ModuleName, { parent: string[]; sub: string[]; selector: string; scope: string }> = {
-  emploiDuTemps: { parent: ['Vie scolaire', 'Emploi du temps'], sub: ['Emploi du temps'], selector: '.cours-simple', scope: 'Semaine affichée par Pronote' },
-  notes: { parent: ['Notes'], sub: ['Mes notes'], selector: '.note-devoir', scope: 'Période sélectionnée par Pronote' },
-  agenda: { parent: ['Cahier de textes'], sub: ['Travail à faire'], selector: '.conteneur-item .titre-matiere', scope: 'Travail à faire chargé dans la vue Pronote' },
-  ressources: { parent: ['Cahier de textes'], sub: ['Contenus et ressources'], selector: '.conteneur-item', scope: 'Séances chargées dans la vue Pronote' },
-  vieScolaire: { parent: ['Vie scolaire'], sub: ['Carnet', 'Absences'], selector: '.liste_contenu_cellule_contenu,.conteneur-item', scope: 'Carnet affiché par Pronote' },
-  competences: { parent: ['Compétences'], sub: ['Mes évaluations'], selector: '.liste_contenu_cellule_contenu,.conteneur-item', scope: 'Évaluations affichées par Pronote' },
-  actualites: { parent: ['Communication'], sub: ['Informations & sondages', 'Informations et sondages'], selector: '.conteneur-item,.liste_contenu_cellule_contenu', scope: 'Liste des informations, sans marquage de lecture' },
-  cantine: { parent: ['Vie scolaire', 'Informations personnelles'], sub: ['Menus', 'Menu de la cantine'], selector: '.conteneur-item,[class*="menu-repas"]', scope: 'Menus affichés par Pronote' },
-};
+async function attachCookies(context: BrowserContext, jar: CookieJar) {
+  const seen = new Set<string>();
+  const packed = [];
+  for (const origin of ['https://ent77.seine-et-marne.fr/', 'https://ent.seine-et-marne.fr/']) {
+    for (const cookie of await jar.getCookies(origin)) {
+      const key = `${cookie.key}|${cookie.domain}|${cookie.path}`;
+      if (seen.has(key) || !cookie.domain) continue;
+      seen.add(key);
+      packed.push({ name: cookie.key, value: cookie.value, domain: cookie.domain, path: cookie.path || '/', secure: cookie.secure, httpOnly: cookie.httpOnly });
+    }
+  }
+  if (packed.length) await context.setCookie(...packed);
+}
+
+async function preparePage(context: BrowserContext): Promise<Page> {
+  const page = await context.newPage();
+  await page.setUserAgent(UA);
+  await page.evaluateOnNewDocument('globalThis.__name = (fn) => fn;');
+  const session = await page.createCDPSession();
+  await session.send('Network.enable');
+  await session.send('Network.setBlockedURLs', { urls: ['*.png', '*.jpg', '*.jpeg', '*.gif', '*.webp', '*.svg', '*.woff', '*.woff2', '*.ttf', '*.mp4', '*.mp3'] });
+  return page;
+}
+
+async function waitPronoteReady(page: Page, timeout: number): Promise<boolean> {
+  try {
+    await page.waitForFunction(() => {
+      const w = window as unknown as { GApplication?: { parametresUtilisateur?: unknown }; GEtatUtilisateur?: { Identification?: unknown } };
+      return !!w.GApplication?.parametresUtilisateur && !!w.GEtatUtilisateur?.Identification && document.querySelectorAll('.item-menu_niveau0').length >= 3;
+    }, { timeout });
+    return true;
+  } catch { return false; }
+}
 
 async function selectModule(page: Page, module: ModuleName): Promise<boolean> {
   const spec = navigation[module];
@@ -75,86 +152,125 @@ async function selectModule(page: Page, module: ModuleName): Promise<boolean> {
   }, { parent: spec.parent, sub: spec.sub });
 }
 
+function applyHtml(module: ModuleName, html: string, data: PronoteData, pronoteUrl: string): number {
+  const spec = navigation[module];
+  if (module === 'emploiDuTemps') { const cours = parseTimetable(html); data.emploiDuTemps = { cours, totalCours: cours.length }; return cours.length; }
+  if (module === 'notes') { const grades = parseGrades(html); data.notes = { ...grades, totalNotes: grades.evaluations.length }; return grades.evaluations.length; }
+  if (module === 'agenda') { const devoirs = parseAssignments(html, pronoteUrl); data.agenda = { devoirs, totalDevoirs: devoirs.length }; return devoirs.length; }
+  if (module === 'ressources') { const seances = parseResources(html, pronoteUrl); data.ressources = { seances, totalSeances: seances.length }; return seances.length; }
+  const elements = parseEntries(html, spec.selector, module);
+  data[module as 'vieScolaire' | 'competences' | 'actualites' | 'cantine'] = { elements };
+  return elements.length;
+}
+
+function failedReport(module: ModuleName, started: number): ModuleReport {
+  return { module, status: 'error', count: 0, durationMs: Date.now() - started, scope: navigation[module].scope, code: 'CONTENT_NOT_CONFIRMED' };
+}
+
+async function captureModule(page: Page, module: ModuleName, data: PronoteData, pronoteUrl: string, timeoutMs: number): Promise<ModuleReport> {
+  const started = Date.now();
+  const spec = navigation[module];
+  if (!await selectModule(page, module)) {
+    return { module, status: 'unavailable', count: 0, durationMs: Date.now() - started, scope: spec.scope, code: 'TAB_UNAVAILABLE' };
+  }
+  const state = await page.waitForFunction((selector: string, hint: string) => {
+    if (document.querySelector(selector)) return 'ready';
+    return new RegExp(hint, 'i').test(document.body?.innerText || '') ? 'empty' : false;
+  }, { timeout: timeoutMs }, spec.selector, EMPTY_HINT).then(handle => handle.jsonValue() as Promise<'ready' | 'empty'>).catch(() => null);
+  const html = await page.content();
+  const count = applyHtml(module, html, data, pronoteUrl);
+  const emptyHint = state === 'empty' || (count === 0 && await page.evaluate((hint: string) => new RegExp(hint, 'i').test(document.body?.innerText || ''), EMPTY_HINT));
+  return {
+    module,
+    status: count > 0 ? 'ok' : emptyHint ? 'empty' : 'error',
+    count,
+    durationMs: Date.now() - started,
+    scope: spec.scope,
+    ...(count === 0 && !emptyHint ? { code: 'CONTENT_NOT_CONFIRMED' } : {}),
+  };
+}
+
 export async function extractPronote(input: Credentials, progress: (stage: string) => void = () => {}): Promise<ExtractionResult> {
   const started = Date.now();
   const authentication = { ent: false, pronote: false };
   const controller = new AbortController();
-  let browser: Browser | undefined;
+  let context: BrowserContext | undefined;
   let timedOut = false;
-  const deadline = setTimeout(() => { timedOut = true; controller.abort(); void browser?.close().catch(() => {}); }, 150000);
+  const deadline = setTimeout(() => { timedOut = true; controller.abort(); void context?.close().catch(() => {}); }, 45000);
   let stage = 'ent';
   try {
     progress('ent');
-    const { jar, person } = await authenticate(input, controller.signal);
+    const [auth] = await Promise.all([authenticate(input, controller.signal), ensureBrowser()]);
     authentication.ent = true;
     stage = 'browser';
     progress(stage);
-    browser = await puppeteer.launch({ headless: true, timeout: 20000, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-background-timer-throttling'], defaultViewport: { width: 1440, height: 1050 } });
-    const context = await browser.createBrowserContext();
-    const cookies = await jar.getCookies('https://ent77.seine-et-marne.fr/');
-    await context.setCookie(...cookies.map(c => ({ name: c.key, value: c.value, domain: c.domain!, path: c.path || '/', secure: c.secure, httpOnly: c.httpOnly })));
-    const page = await context.newPage();
-    await page.setUserAgent(UA);
-    // tsx/esbuild can reference __name in serialized functions; never depend on page globals.
-    await page.evaluateOnNewDocument('globalThis.__name = (fn) => fn;');
-    await page.setRequestInterception(true);
-    page.on('request', request => {
-      if (request.isInterceptResolutionHandled()) return;
-      try {
-        const url = new URL(request.url());
-        const blocked = (url.protocol !== 'https:' && url.protocol !== 'data:' && url.protocol !== 'blob:') || (url.protocol === 'https:' && !allowedHost(url.hostname)) || ['image', 'media', 'font'].includes(request.resourceType());
-        void (blocked ? request.abort() : request.continue()).catch(() => {});
-      } catch { void request.abort().catch(() => {}); }
-    });
-    stage = 'pronote'; progress(stage);
-    await page.goto(input.pronoteUrl, { waitUntil: 'networkidle2', timeout: 40000 });
-    await page.waitForFunction(() => {
-      const w = window as unknown as { GApplication?: { parametresUtilisateur?: unknown }; GEtatUtilisateur?: { Identification?: unknown } };
-      return !!w.GApplication?.parametresUtilisateur && !!w.GEtatUtilisateur?.Identification && document.querySelectorAll('.item-menu_niveau0').length >= 3;
-    }, { timeout: 15000 }).catch(() => { throw new ApiError('PRONOTE_AUTH_FAILED', 401, 'pronote', 'La session ENT est valide mais l’espace élève Pronote n’a pas été ouvert.'); });
-    if (new URL(page.url()).hostname !== new URL(input.pronoteUrl).hostname) throw new ApiError('PRONOTE_AUTH_FAILED', 401, 'pronote', 'La redirection SSO n’a pas abouti sur Pronote.');
-    authentication.pronote = true;
-    const data = emptyData(person);
-    const reports: ModuleReport[] = [];
-    for (const module of input.modules) {
-      controller.signal.throwIfAborted();
-      stage = module; progress(stage);
-      const t = Date.now(); const spec = navigation[module];
-      if (!await selectModule(page, module)) {
-        reports.push({ module, status: 'unavailable', count: 0, durationMs: Date.now()-t, scope: spec.scope, code: 'TAB_UNAVAILABLE' }); continue;
+    const browser = await ensureBrowser();
+    context = await browser.createBrowserContext();
+    const session = context;
+    await attachCookies(session, auth.jar);
+
+    stage = 'pronote';
+    progress(stage);
+    const data = emptyData(auth.person);
+    const reports = new Map<ModuleName, ModuleReport>();
+    const pages = await Promise.all(input.modules.map(() => preparePage(session)));
+    try {
+      await Promise.all(pages.map(page => page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 8000 })));
+      const ready = await Promise.all(pages.map(page => waitPronoteReady(page, 7000)));
+      if (!ready.some(Boolean) || pages.every(page => new URL(page.url()).hostname !== new URL(input.pronoteUrl).hostname)) {
+        throw new ApiError('PRONOTE_AUTH_FAILED', 401, 'pronote', 'La session ENT est valide mais l’espace élève Pronote n’a pas été ouvert.');
       }
-      await page.waitForNetworkIdle({ idleTime: 500, timeout: 3000 }).catch(() => {});
-      await pause(650);
-      await page.waitForSelector(spec.selector, { timeout: 4000 }).catch(() => {});
-      // REAL DOM serialization. No uncalled function strings, screenshots, or persisted HTML.
-      const html = await page.content();
-      let count = 0;
-      if (module === 'emploiDuTemps') { const cours = parseTimetable(html); data.emploiDuTemps = { cours, totalCours: cours.length }; count=cours.length; }
-      if (module === 'notes') { const grades=parseGrades(html); data.notes={...grades,totalNotes:grades.evaluations.length};count=grades.evaluations.length; }
-      if (module === 'agenda') { const devoirs=parseAssignments(html,input.pronoteUrl);data.agenda={devoirs,totalDevoirs:devoirs.length};count=devoirs.length; }
-      if (module === 'ressources') { const seances=parseResources(html,input.pronoteUrl);data.ressources={seances,totalSeances:seances.length};count=seances.length; }
-      if (['vieScolaire','competences','actualites','cantine'].includes(module)) {
-        const elements=parseEntries(html,spec.selector,module);
-        data[module as 'vieScolaire'|'competences'|'actualites'|'cantine']={elements}; count=elements.length;
+      authentication.pronote = true;
+      progress('modules');
+      await Promise.all(input.modules.map(async (module, index) => {
+        const begun = Date.now();
+        const page = pages[index];
+        if (!ready[index]) {
+          reports.set(module, failedReport(module, begun));
+          return;
+        }
+        reports.set(module, await withTimeout(captureModule(page, module, data, input.pronoteUrl, 1600), 3500, failedReport(module, begun)));
+      }));
+      const fallback = pages.find((_, index) => ready[index]);
+      if (fallback) {
+        for (const module of input.modules) {
+          const report = reports.get(module);
+          if (report && CORE.includes(module) && report.status === 'error') {
+            reports.set(module, await withTimeout(captureModule(fallback, module, data, input.pronoteUrl, 1600), 2500, report));
+          }
+        }
       }
-      const emptyConfirmed = count === 0 && await page.evaluate(() => /aucun(?:e)? (?:note|devoir|travail|cours|absence|retard|punition|sanction|evaluation|évaluation|information|menu|element|élément)|pas de (?:note|travail|cours|devoir)|aucun element|aucun élément/i.test(document.body.innerText));
-      reports.push({ module, status: count>0?'ok':emptyConfirmed?'empty':'error', count, durationMs:Date.now()-t, scope:spec.scope, ...(count===0&&!emptyConfirmed?{code:'CONTENT_NOT_CONFIRMED'}:{}) });
+    } finally {
+      await Promise.all(pages.map(page => page.close().catch(() => {})));
     }
-    const extracted = reports.some(m=>m.status==='ok');
-    const readable = reports.some(m=>m.status==='ok'||m.status==='empty');
-    const success = readable;
-    const partial = reports.some(m=>m.status==='error'||m.status==='unavailable');
-    const result: ExtractionResult = { version:VERSION,success,status:success?(partial?'partial':'done'):'error',timestamp:new Date().toISOString(),durationMs:Date.now()-started,authentication,modules:reports,data,...(!success?{error:{code:'EXTRACTION_EMPTY',message:'Aucun module demandé n’a pu être lu de façon vérifiable.',stage:'parsing'}}:{}) };
-    if (!extracted && !reports.some(m=>m.status==='empty')) result.success=false;
+
+    const ordered = input.modules.map(module => reports.get(module)).filter((report): report is ModuleReport => Boolean(report));
+    const extracted = ordered.some(m => m.status === 'ok');
+    const readable = ordered.some(m => m.status === 'ok' || m.status === 'empty');
+    const partial = ordered.some(m => m.status === 'error' || m.status === 'unavailable');
+    const result: ExtractionResult = {
+      version: VERSION,
+      success: readable,
+      status: readable ? (partial ? 'partial' : 'done') : 'error',
+      timestamp: new Date().toISOString(),
+      durationMs: Date.now() - started,
+      authentication,
+      modules: ordered,
+      data,
+      ...(!readable ? { error: { code: 'EXTRACTION_EMPTY', message: 'Aucun module demandé n’a pu être lu de façon vérifiable.', stage: 'parsing' } } : {}),
+    };
+    if (!extracted && !ordered.some(m => m.status === 'empty')) result.success = false;
     assertNoCredentials(result);
-    // Do not permit an upstream echo of the submitted password in a result.
-    if (input.password.length >= 4 && JSON.stringify(result).includes(input.password)) throw new ApiError('UNSAFE_RESULT',500,'serialization','Un contenu sensible a été bloqué.');
+    if (input.password.length >= 4 && JSON.stringify(result).includes(input.password)) throw new ApiError('UNSAFE_RESULT', 500, 'serialization', 'Un contenu sensible a été bloqué.');
     return result;
   } catch (error) {
-    const err = timedOut ? new ApiError('EXTRACTION_TIMEOUT',504,stage,'L’extraction a dépassé 150 secondes.') : error instanceof ApiError ? error : new ApiError('UPSTREAM_ERROR',502,stage,'Le traitement a été interrompu à cette étape. Aucun détail de connexion n’est exposé.');
-    return safeFailure(err,Date.now()-started,authentication);
+    const err = timedOut
+      ? new ApiError('EXTRACTION_TIMEOUT', 504, stage, 'L’extraction a dépassé 45 secondes.')
+      : error instanceof ApiError ? error : new ApiError('UPSTREAM_ERROR', 502, stage, 'Le traitement a été interrompu à cette étape. Aucun détail de connexion n’est exposé.');
+    return safeFailure(err, Date.now() - started, authentication);
   } finally {
-    clearTimeout(deadline);controller.abort();
-    await browser?.close().catch(()=>{});
+    clearTimeout(deadline);
+    controller.abort();
+    await context?.close().catch(() => {});
   }
 }

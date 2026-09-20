@@ -3,27 +3,13 @@ import assert from 'node:assert/strict';
 import { validateCredentials, assertNoCredentials, safeFailure, summarize, ApiError } from '../src/pronote/contracts';
 import { dateFromLabel, parseTimetable, parseGrades, parseAssignments, parseResources } from '../src/pronote/parsers';
 import { seal, unseal, randomToken, equalSecret } from '../worker/crypto';
-import { isConsoleOriginAllowed, OPEN_CORS } from '../src/pronote/http';
+import { isConsoleOriginAllowed } from '../src/pronote/http';
 const input={username:'test-user',password:'not-a-real-password'};
-test('console accepts every browser origin, including behind a reverse proxy',()=>{
-  for (const origin of [
-    'https://console.example.test',
-    'http://127.0.0.1:3000',
-    'https://jeanhug.github.io',
-    'https://app.someone-else.test',
-    'null',
-  ]) {
-    assert.equal(isConsoleOriginAllowed(new Request('http://localhost:3000/api/pronote',{headers:{origin,host:'localhost:3000','x-forwarded-host':'console.example.test'}})),true);
-  }
-  // Requests without an Origin (curl, server-to-server) are also allowed.
-  assert.equal(isConsoleOriginAllowed(new Request('http://localhost:3000/api/pronote')),true);
-});
-test('open CORS headers never request credentialed browser access',()=>{
-  for (const [name, value] of Object.entries(OPEN_CORS)) {
-    assert.notEqual(name.toLowerCase(),'access-control-allow-credentials');
-    assert.notEqual(String(value).toLowerCase(),'true');
-  }
-  assert.equal(OPEN_CORS['Access-Control-Allow-Origin'],'*');
+test('console origin works behind HTTPS proxy without accepting other sites',()=>{
+  assert.equal(isConsoleOriginAllowed(new Request('http://localhost:3000/api/pronote',{headers:{origin:'https://console.example.test',host:'localhost:3000','x-forwarded-host':'console.example.test'}})),true);
+  assert.equal(isConsoleOriginAllowed(new Request('http://localhost:3000/api/pronote',{headers:{origin:'http://127.0.0.1:3000',host:'127.0.0.1:3000'}})),true);
+  assert.equal(isConsoleOriginAllowed(new Request('http://localhost:3000/api/pronote',{headers:{origin:'https://evil.example.test','x-forwarded-host':'console.example.test'}})),false);
+  assert.equal(isConsoleOriginAllowed(new Request('http://localhost:3000/api/pronote',{headers:{origin:'null'}})),false);
 });
 test('validates ENT77 request and selects default modules',()=>{assert.equal(validateCredentials(input).modules.length,8);});
 test('rejects missing and malformed credentials',()=>{for(const value of [null,[],{},1,{...input,password:''},{...input,username:'x'.repeat(201)}])assert.throws(()=>validateCredentials(value));});
