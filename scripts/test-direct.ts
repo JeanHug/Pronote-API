@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { extractPronote, closeSharedBrowser } from '../src/pronote/engine';
+import { extractPronote } from '../src/pronote/engine';
 import { validateCredentials, summarize } from '../src/pronote/contracts';
 async function main() {
   if (!process.env.ENT_ID || !process.env.ENT_PASS) throw new Error('ENT_SECRETS_MISSING');
@@ -8,4 +8,4 @@ async function main() {
   const ok = result.success && result.authentication.pronote && result.modules.some(m=>m.module==='emploiDuTemps'&&m.count>0) && result.modules.some(m=>m.module==='agenda'&&m.count>0);
   process.exitCode = ok ? 0 : 1;
 }
-main().catch(()=>{console.error('DIRECT_TEST_FAILED');process.exitCode=1;}).finally(() => closeSharedBrowser());
+main().catch(()=>{console.error('DIRECT_TEST_FAILED');process.exitCode=1;});

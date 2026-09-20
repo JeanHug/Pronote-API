@@ -8,7 +8,7 @@ Complete replacement of the previous v4 gateway, DOM snapshots, runner, and work
 
 1. The Cloudflare Worker `pronote-api` validates HTTP requests and exposes documentation.
 2. A new SQLite-backed Durable Object `Coordinator` retains AES-GCM encrypted pending requests and results. Credentials are cleared **when claimed**, not kept with results. A per-job random capability is needed to read or delete a result.
-3. A GitHub Actions VM runs the new browser service. It authenticates against the actual ENT form endpoint, verifies `/auth/oauth2/userinfo`, transfers session cookies in memory into an isolated Chromium context, then **opens every requested Pronote module in parallel pages** (same session, no request-interception deadlock). Images/fonts are blocked. A Chromium process is reused between jobs; each job still gets a fresh browser context. Typical extraction is ~15 s, dominated by Pronote’s own boot.
+3. A GitHub Actions VM runs the new browser service. It authenticates against the actual ENT form endpoint, verifies `/auth/oauth2/userinfo`, transfers session cookies in memory as groundwork, then opens **all requested Pronote pages at the same time** — one isolated browser context per rubric, each with its own SSO session. Wall-clock latency approaches the slowest rubric instead of the sum of eight sequential captures. It reads real rendered pages; no uncalled snapshot expression.
 4. The Next.js console proxies user-supplied credentials to the Worker. PostgreSQL, accessed through Drizzle, stores **only safe verification metadata**. It never stores passwords, cookies, student names, individual grades or HTML.
 
 There is no GitHub issue queue, no results published in issues, no Express server on the Actions VM, and no Cloudflare KV namespace. A Durable Object remains necessary for the outbound-only runner architecture. This version does not claim to use Pronote’s native protocol.
@@ -46,7 +46,7 @@ Modules: `emploiDuTemps`, `notes`, `agenda`, `ressources`, `vieScolaire`, `compe
 - Results have a five-minute deadline, encrypted at rest and protected by a separate 256-bit capability. Cleanup is periodic; use DELETE for immediate erasure.
 - `RUNNER_TOKEN` is independent from the GitHub PAT. Runner requests require v5 protocol and successful results require a valid job lease.
 - Only a credential-key-free, allowlisted summary is published in health/CI output. No HTML or full response artifact.
-- `API_KEYS` can be configured as a comma-separated Cloudflare secret to restrict clients further. Without it the service accepts callers' own ENT credentials, with the stated abuse limits. CORS is intentionally public (`Access-Control-Allow-Origin: *`): any website may call the API. Browser cookies are never accepted as ambient authentication and `Access-Control-Allow-Credentials` is not enabled.
+- **CORS is fully open.** Every public route answers `Access-Control-Allow-Origin: *`, so any website, page or application can call the API directly from a browser. `Access-Control-Allow-Credentials` is never emitted and no cookie is ever used, so `*` carries no ambient authority: each request carries its own credentials and receives exactly its own response. `API_KEYS` can still be configured as a comma-separated Cloudflare secret to require a key on top of that.
 - Credentials are never supplied by a public 'test my environment account' endpoint.
 
 ## Workflows
