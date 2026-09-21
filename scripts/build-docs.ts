@@ -200,7 +200,7 @@ const limits: [topic: string, value: string, behavior: string][] = [
   ['Bail d’un job', '3 minutes', 'Un job interrompu est explicitement en échec.'],
   ['Session du moteur', '260 minutes', 'Dans un job GitHub Actions de 300 minutes.'],
   ['Heartbeat moteur', 'Valable 65 secondes', 'Protocole v5 exigé.'],
-  ['Attente synchrone', '16 secondes', 'Puis 202 avec jobId et jobToken.'],
+  ['Attente synchrone', '1,5 seconde', 'Puis 202 avec jobId et jobToken, pour ne pas faire expirer le navigateur.'],
   ['Suivi recommandé', 'Toutes les 3 secondes', 'Arrêtez dès que le statut HTTP n’est plus 202.'],
   ['Nettoyage', 'Chaque minute', 'Alarme du Durable Object. Aucun cron Worker.'],
   ['Rubriques', '8 modules', 'Statuts ok, empty, unavailable ou error.'],
@@ -489,7 +489,7 @@ ${'{\n  "username": "prenom.nom",\n  "password": "••••••••"\n}'}
 <ol>
 <li>Vous envoyez <code>POST /api/v1/scrape-pronote</code>.</li>
 <li>Le Worker chiffre la demande et la met en file, puis démarre un moteur si aucun n’est en ligne.</li>
-<li>Il attend jusqu’à 16 secondes. Si le résultat arrive, vous recevez directement <code>200</code> (ou <code>401</code> / <code>502</code> selon le cas).</li>
+<li>Il répond en 1,5 seconde. Si l’extraction n’est pas terminée, vous recevez <code>202</code> avec <code>jobId</code> et <code>jobToken</code> ; le suivi continue automatiquement.</li>
 <li>Sinon vous recevez <code>202</code> avec <code>jobId</code>, <code>jobToken</code> et <code>statusUrl</code>. <strong>Le traitement continue.</strong></li>
 <li>Vous interrogez <code>GET /api/v1/job/&lt;jobId&gt;</code> avec <code>X-Job-Token</code> toutes les 3 secondes.</li>
 <li>Dès que le statut HTTP n’est plus <code>202</code>, vous avez le résultat. Appelez <code>DELETE</code> pour l’effacer immédiatement.</li>
