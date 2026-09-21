@@ -2,6 +2,7 @@ import puppeteer, { type Browser, type BrowserContext, type Page } from 'puppete
 import { CookieJar } from 'tough-cookie';
 import { ApiError, assertNoCredentials, emptyData, safeFailure, VERSION, type Credentials, type ExtractionResult, type ModuleName, type ModuleReport, type Person, type PronoteData } from './contracts';
 import { parseTimetable, parseGrades, parseAssignments, parseResources, parseEntries } from './parsers';
+import { loginEduConnect } from './educonnect';
 
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
 const EMPTY_HINT = 'aucun(?:e)? (?:note|devoir|travail|cours|absence|retard|punition|sanction|evaluation|évaluation|information|menu|element|élément)|pas de (?:note|travail|cours|devoir)|aucun element|aucun élément';
@@ -118,13 +119,15 @@ async function attachCookies(context: BrowserContext, jar: CookieJar) {
   if (packed.length) await context.setCookie(...packed);
 }
 
-async function preparePage(context: BrowserContext): Promise<Page> {
+async function preparePage(context: BrowserContext, lean = true): Promise<Page> {
   const page = await context.newPage();
   await page.setUserAgent(UA);
   await page.evaluateOnNewDocument('globalThis.__name = (fn) => fn;');
-  const session = await page.createCDPSession();
-  await session.send('Network.enable');
-  await session.send('Network.setBlockedURLs', { urls: ['*.png', '*.jpg', '*.jpeg', '*.gif', '*.webp', '*.svg', '*.woff', '*.woff2', '*.ttf', '*.mp4', '*.mp3'] });
+  if (lean) {
+    const session = await page.createCDPSession();
+    await session.send('Network.enable');
+    await session.send('Network.setBlockedURLs', { urls: ['*.png', '*.jpg', '*.jpeg', '*.gif', '*.webp', '*.woff', '*.woff2', '*.ttf', '*.mp4', '*.mp3'] });
+  }
   return page;
 }
 
@@ -192,31 +195,41 @@ async function captureModule(page: Page, module: ModuleName, data: PronoteData, 
 
 export async function extractPronote(input: Credentials, progress: (stage: string) => void = () => {}): Promise<ExtractionResult> {
   const started = Date.now();
-  const authentication = { ent: false, pronote: false };
+  const authentication: ExtractionResult['authentication'] = { ent: false, pronote: false, provider: input.provider };
   const controller = new AbortController();
   let context: BrowserContext | undefined;
   let timedOut = false;
   const deadline = setTimeout(() => { timedOut = true; controller.abort(); void context?.close().catch(() => {}); }, 45000);
   let stage = 'ent';
   try {
-    progress('ent');
-    const [auth] = await Promise.all([authenticate(input, controller.signal), ensureBrowser()]);
-    authentication.ent = true;
-    stage = 'browser';
-    progress(stage);
+    progress(input.provider);
+    await ensureBrowser();
     const browser = await ensureBrowser();
     context = await browser.createBrowserContext();
     const session = context;
-    await attachCookies(session, auth.jar);
+    let person: Person = { nomComplet: '', prenom: '', nom: '', classe: null, etablissement: null };
+    if (input.provider === 'educonnect') {
+      stage = 'educonnect';
+      const login = await preparePage(session, false);
+      try { person = await loginEduConnect(login, input); }
+      finally { await login.close().catch(() => {}); }
+    } else {
+      stage = 'ent';
+      const auth = await authenticate(input, controller.signal);
+      person = auth.person;
+      await attachCookies(session, auth.jar);
+    }
+    authentication.ent = true;
+    authentication.provider = input.provider;
 
     stage = 'pronote';
     progress(stage);
-    const data = emptyData(auth.person);
+    const data = emptyData(person);
     const reports = new Map<ModuleName, ModuleReport>();
     const pages = await Promise.all(input.modules.map(() => preparePage(session)));
     try {
-      await Promise.all(pages.map(page => page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 8000 })));
-      const ready = await Promise.all(pages.map(page => waitPronoteReady(page, 7000)));
+      await Promise.all(pages.map(page => page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 12000 })));
+      const ready = await Promise.all(pages.map(page => waitPronoteReady(page, 9000)));
       if (!ready.some(Boolean) || pages.every(page => new URL(page.url()).hostname !== new URL(input.pronoteUrl).hostname)) {
         throw new ApiError('PRONOTE_AUTH_FAILED', 401, 'pronote', 'La session ENT est valide mais l’espace élève Pronote n’a pas été ouvert.');
       }
@@ -254,7 +267,7 @@ export async function extractPronote(input: Credentials, progress: (stage: strin
       status: readable ? (partial ? 'partial' : 'done') : 'error',
       timestamp: new Date().toISOString(),
       durationMs: Date.now() - started,
-      authentication,
+      authentication: { ...authentication, provider: input.provider },
       modules: ordered,
       data,
       ...(!readable ? { error: { code: 'EXTRACTION_EMPTY', message: 'Aucun module demandé n’a pu être lu de façon vérifiable.', stage: 'parsing' } } : {}),

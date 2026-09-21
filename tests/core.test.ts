@@ -15,6 +15,13 @@ test('validates ENT77 request and selects default modules',()=>{assert.equal(val
 test('rejects missing and malformed credentials',()=>{for(const value of [null,[],{},1,{...input,password:''},{...input,username:'x'.repeat(201)}])assert.throws(()=>validateCredentials(value));});
 test('rejects SSRF targets and session-bearing URLs',()=>{for(const pronoteUrl of ['http://school.index-education.net/pronote/eleve.html','https://127.0.0.1/pronote/eleve.html','https://school.index-education.net.evil.test/pronote/eleve.html','https://school.index-education.net/pronote/eleve.html?ticket=private','https://a:b@school.index-education.net/pronote/eleve.html','https://school.index-education.net:8443/pronote/eleve.html'])assert.throws(()=>validateCredentials({...input,pronoteUrl}));});
 test('does not silently accept unsupported ENT or modules',()=>{assert.throws(()=>validateCredentials({...input,entUrl:'https://evil.test'}));assert.throws(()=>validateCredentials({...input,modules:['unknown']}));assert.throws(()=>validateCredentials({...input,modules:[]}));});
+test('accepts EduConnect for student and parent accounts',()=>{
+  assert.equal(validateCredentials({...input,provider:'educonnect'}).provider,'educonnect');
+  assert.equal(validateCredentials({...input,provider:'educonnect',account:'parent'}).account,'parent');
+  assert.equal(validateCredentials({...input,entUrl:'https://educonnect.education.gouv.fr/'}).provider,'educonnect');
+  assert.throws(()=>validateCredentials({...input,provider:'google'}));
+  assert.throws(()=>validateCredentials({...input,account:'teacher'}));
+});
 test('deduplicates valid modules',()=>{assert.deepEqual(validateCredentials({...input,modules:['notes','notes']}).modules,['notes']);});
 test('date parsing handles accents and year transitions without local timezone shift',()=>{const ref=new Date('2026-09-17T12:00:00Z');assert.equal(dateFromLabel('Cours du 14 septembre de 8 heures 30',ref),'2026-09-14');assert.equal(dateFromLabel('Pour le 3 février 2027',ref),'2027-02-03');assert.equal(dateFromLabel('31/02/2026',ref),null);});
 test('timetable reads accessible date and time without pixel inference',()=>{const a=parseTimetable('<div class="cours-simple" aria-label="Cours du 14 septembre 2026 de 8 heures 30 à 10 heures 20"><div class="content_cours"><div role="listitem">MATHEMATIQUES</div><div role="listitem">204</div></div></div>');assert.equal(a.length,1);assert.equal(a[0].heureDebut,'08:30');assert.equal(a[0].heureFin,'10:20');assert.equal(a[0].salle,'204');assert.equal(a[0].professeur,null);});

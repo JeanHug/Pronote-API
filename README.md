@@ -31,7 +31,7 @@ Modules: `emploiDuTemps`, `notes`, `agenda`, `ressources`, `vieScolaire`, `compe
 
 ### Scope and known limitations
 
-- ENT77's local username/password login and Pronote **student** space only. EduConnect/MFA or a mandatory password/terms action returns an explicit error; those controls are not bypassed.
+- `provider` is `ent77` by default, or `educonnect`. EduConnect accepts `account: "student"` (default) or `"parent"` and follows the official SAML path, then opens Pronote. MFA and mandatory account actions return an explicit error and are not bypassed.
 - Reads the timetable week, grades period and contents currently loaded by Pronote. **Not a guarantee of a full school year or of unloaded/virtualized records.**
 - Grades with unavailable coefficients, missing dates or missing scales use `null`; no assumptions or invented averages.
 - Some document buttons do not expose a direct download URL. Their names are retained with `url: null`; session cookies are never returned.

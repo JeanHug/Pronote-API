@@ -1,14 +1,18 @@
-export const VERSION = '5.0.0';
+export const VERSION = '5.1.0';
 export const DEFAULT_PRONOTE = 'https://0771068t.index-education.net/pronote/eleve.html';
 export const DEFAULT_ENT = 'https://ent.seine-et-marne.fr/';
 export const MODULES = ['emploiDuTemps', 'notes', 'agenda', 'ressources', 'vieScolaire', 'competences', 'actualites', 'cantine'] as const;
 export type ModuleName = typeof MODULES[number];
+export type LoginProvider = 'ent77' | 'educonnect';
+export type AccountKind = 'student' | 'parent';
 export interface Credentials {
   username: string;
   password: string;
   pronoteUrl: string;
   entUrl: string;
   modules: ModuleName[];
+  provider: LoginProvider;
+  account: AccountKind;
 }
 export interface ModuleReport {
   module: ModuleName;
@@ -43,7 +47,7 @@ export interface ExtractionResult {
   requestId?: string;
   timestamp: string;
   durationMs: number;
-  authentication: { ent: boolean; pronote: boolean };
+  authentication: { ent: boolean; pronote: boolean; provider?: LoginProvider };
   modules: ModuleReport[];
   data?: PronoteData;
   error?: { code: string; message: string; stage: string };
@@ -58,23 +62,28 @@ export function validateCredentials(body: unknown): Credentials {
   const password = typeof value.password === 'string' ? value.password : '';
   if (!username || !password || username.length > 200 || password.length > 200) throw new ApiError('INVALID_REQUEST', 400, 'validation', 'username et password sont requis (200 caractères maximum).');
   const pronoteUrl = typeof value.pronoteUrl === 'string' ? value.pronoteUrl : DEFAULT_PRONOTE;
-  const entUrl = typeof value.entUrl === 'string' ? value.entUrl : DEFAULT_ENT;
+  const requestedProvider = typeof value.provider === 'string' ? value.provider : '';
+  const entUrl = typeof value.entUrl === 'string' && value.entUrl ? value.entUrl : DEFAULT_ENT;
+  let provider: LoginProvider = requestedProvider === 'educonnect' || /educonnect\.education\.gouv\.fr/i.test(entUrl) ? 'educonnect' : 'ent77';
+  if (requestedProvider && requestedProvider !== 'ent77' && requestedProvider !== 'educonnect') throw new ApiError('UNSUPPORTED_PROVIDER', 400, 'validation', 'provider doit valoir ent77 ou educonnect.');
+  if (requestedProvider === 'ent77' || requestedProvider === 'educonnect') provider = requestedProvider;
+  const account: AccountKind = value.account === 'parent' ? 'parent' : value.account === 'student' || value.account === undefined ? 'student' : (() => { throw new ApiError('UNSUPPORTED_ACCOUNT', 400, 'validation', 'account doit valoir student ou parent.'); })();
   let url: URL;
   try { url = new URL(pronoteUrl); } catch { throw new ApiError('INVALID_URL', 400, 'validation', 'URL Pronote invalide.'); }
   if (url.protocol !== 'https:' || url.port || url.username || url.password || url.search || url.hash || !/^[a-z0-9-]+\.index-education\.net$/i.test(url.hostname) || url.pathname !== '/pronote/eleve.html') {
     throw new ApiError('FORBIDDEN_HOST', 400, 'validation', 'Un espace élève HTTPS hébergé sur index-education.net est requis.');
   }
-  if (entUrl !== DEFAULT_ENT && entUrl !== 'https://ent77.seine-et-marne.fr/') throw new ApiError('UNSUPPORTED_ENT', 400, 'validation', 'Cette version prend en charge ENT77 uniquement.');
+  if (provider === 'ent77' && entUrl !== DEFAULT_ENT && entUrl !== 'https://ent77.seine-et-marne.fr/') throw new ApiError('UNSUPPORTED_ENT', 400, 'validation', 'ENT77 accepte uniquement ses portails officiels. Pour EduConnect, envoyez provider: "educonnect".');
   const modules = value.modules === undefined ? [...MODULES] : value.modules;
   if (!Array.isArray(modules) || !modules.length || modules.length > MODULES.length || modules.some(m => typeof m !== 'string' || !(MODULES as readonly string[]).includes(m))) throw new ApiError('INVALID_MODULES', 400, 'validation', 'La liste modules contient une rubrique inconnue.');
-  return { username, password, pronoteUrl: url.href, entUrl, modules: [...new Set(modules)] as ModuleName[] };
+  return { username, password, pronoteUrl: url.href, entUrl, modules: [...new Set(modules)] as ModuleName[], provider, account };
 }
 export function safeFailure(error: unknown, durationMs = 0, authentication = { ent: false, pronote: false }): ExtractionResult {
   const known = error instanceof ApiError;
   return { version: VERSION, success: false, status: 'error', timestamp: new Date().toISOString(), durationMs, authentication, modules: [], error: { code: known ? error.code : 'INTERNAL_ERROR', message: known ? error.message : 'Une erreur technique a interrompu l’extraction. Aucun détail de session n’est publié.', stage: known ? error.stage : 'internal' } };
 }
 export function summarize(result: ExtractionResult) {
-  return { version: result.version, success: result.success, status: result.status, durationMs: result.durationMs, timestamp: result.timestamp, authentication: result.authentication, modules: result.modules.map(({ module, status, count, durationMs, scope, code }) => ({ module, status, count, durationMs, scope, ...(code ? { code } : {}) })), errorCode: result.error?.code ?? null };
+  return { version: result.version, success: result.success, status: result.status, durationMs: result.durationMs, timestamp: result.timestamp, authentication: result.authentication, modules: result.modules.map(({ module, status, count, durationMs, scope, code }) => ({ module, status, count, durationMs, scope, ...(code ? { code } : {}) })), errorCode: result.error?.code ?? null, provider: result.authentication.provider ?? null };
 }
 export function assertNoCredentials(value: unknown): void {
   if (!value || typeof value !== 'object') return;
