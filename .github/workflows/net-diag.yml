@@ -1,0 +1,9 @@
+name: net diag
+on: { workflow_dispatch: {} }
+jobs:
+  d:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -s https://ipinfo.io/json
+      - run: |
+          curl -s -o /dev/null -w "EDU student: %{http_code} -> %{redirect_url}\n" -D - https://ent77.seine-et-marne.fr/auth/saml/authn/student | grep -iE "location|HTTP/" | head -8
