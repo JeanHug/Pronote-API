@@ -36,4 +36,7 @@ jobs:
         env:
           WORKER_URL: https://pronote-api.hugdu77777.workers.dev
           RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+          # Optional French egress used ONLY for EduConnect (Ministry IdP blocks datacenter IPs).
+          # Format: http://user:pass@host:port — the local ENT77 path never uses it.
+          EDUCONNECT_PROXY: ${{ secrets.EDUCONNECT_PROXY }}
         run: npx tsx scripts/runner.ts

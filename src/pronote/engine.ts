@@ -47,6 +47,22 @@ async function ensureBrowser(): Promise<Browser> {
   return sharedBrowser;
 }
 
+/**
+ * Optional French egress for EduConnect only. Format: http://user:pass@host:port or http://host:port.
+ * Credentials are stripped from the --proxy-server value and supplied through page.authenticate().
+ */
+function eduConnectProxy(): { server: string; auth?: { username: string; password: string } } | undefined {
+  const raw = (process.env.EDUCONNECT_PROXY || '').trim();
+  if (!raw) return undefined;
+  try {
+    const url = new URL(raw);
+    if (!['http:', 'https:', 'socks5:'].includes(url.protocol)) return undefined;
+    const server = `${url.protocol}//${url.hostname}${url.port ? `:${url.port}` : ''}`;
+    const auth = url.username ? { username: decodeURIComponent(url.username), password: decodeURIComponent(url.password) } : undefined;
+    return { server, auth };
+  } catch { return undefined; }
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
   return new Promise(resolve => {
     const timer = setTimeout(() => resolve(fallback), ms);
@@ -207,12 +223,17 @@ export async function extractPronote(input: Credentials, progress: (stage: strin
     const entAuth = input.provider === 'educonnect' ? null : authenticate(input, controller.signal);
     await browserReady;
     const browser = await ensureBrowser();
-    context = await browser.createBrowserContext();
+    // EduConnect (Ministry IdP) rejects datacenter egress ("Accès perturbé"). When EDUCONNECT_PROXY is
+    // configured, only the EduConnect session is routed through that French residential/ISP proxy via a
+    // per-context proxy; the local ENT77 path keeps the direct, fastest network path.
+    const proxy = input.provider === 'educonnect' ? eduConnectProxy() : undefined;
+    context = await browser.createBrowserContext(proxy ? { proxyServer: proxy.server, proxyBypassList: ['<-loopback>'] } : undefined);
     const session = context;
     let person: Person = { nomComplet: '', prenom: '', nom: '', classe: null, etablissement: null };
     if (input.provider === 'educonnect') {
       stage = 'educonnect';
       const login = await preparePage(session, false);
+      if (proxy?.auth) await login.authenticate(proxy.auth);
       try { person = await loginEduConnect(login, input); }
       finally { await login.close().catch(() => {}); }
     } else {
