@@ -1,15 +1,15 @@
 import type { Page } from 'puppeteer';
 import { ApiError, type AccountKind, type Person } from './contracts';
 
-const STUDENT_START = 'https://ent77.seine-et-marne.fr/auth/saml/authn/student';
-const PARENT_START = 'https://ent77.seine-et-marne.fr/auth/saml/authn/relative';
+const USER_SELECTOR = 'input[name="j_username"], input[name="username"], input#username, input[type="email"], input[name="email"]';
+const PASSWORD_SELECTOR = 'input[name="j_password"], input[name="password"], input#password, input[type="password"]';
 
 function blocked(text: string): boolean {
-  return /accès perturbé|acces perturbe|difficultés techniques|difficultes techniques/i.test(text);
+  return /accès perturbé|acces perturbe|difficultés techniques|difficultes techniques|service rencontre/i.test(text);
 }
 
-async function pageText(page: Page): Promise<string> {
-  return page.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 2000));
+async function textOf(page: Page): Promise<string> {
+  return page.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 2500)).catch(() => '');
 }
 
 async function fill(page: Page, selector: string, value: string): Promise<boolean> {
@@ -27,98 +27,113 @@ async function fill(page: Page, selector: string, value: string): Promise<boolea
   return true;
 }
 
-async function clickSubmit(page: Page): Promise<void> {
-  const clicked = await page.evaluate(() => {
-    const candidates = Array.from(document.querySelectorAll<HTMLElement>('button, input[type="submit"], [role="button"]'));
+async function clickSubmit(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const form = document.querySelector('form');
+    const candidates = Array.from((form || document).querySelectorAll<HTMLElement>('button, input[type="submit"], [role="button"]'));
     const target = candidates.find(el => {
-      const text = (el.innerText || (el as HTMLInputElement).value || '').toLowerCase();
-      return el.getAttribute('type') === 'submit' || /valider|continuer|se connecter|connexion|suivant/.test(text);
+      const text = (el.innerText || (el as HTMLInputElement).value || el.getAttribute('name') || '').toLowerCase();
+      return el.getAttribute('type') === 'submit' || /valider|continuer|se connecter|connexion|suivant|_eventid_proceed/.test(text);
     });
+    if (target) { target.click(); return true; }
+    if (form) { (form as HTMLFormElement).requestSubmit(); return true; }
+    return false;
+  });
+}
+
+async function chooseAccount(page: Page, account: AccountKind): Promise<boolean> {
+  return page.evaluate((kind: string) => {
+    const wanted = kind === 'parent' ? /responsable|parent|représentant|representant/i : /élève|eleve|enfant|collégien|collegien|lycéen|lyceen/i;
+    const target = Array.from(document.querySelectorAll<HTMLElement>('a,button,[role="button"]')).find(el => wanted.test(el.innerText || el.getAttribute('aria-label') || ''));
     if (!target) return false;
     target.click();
     return true;
-  });
-  if (!clicked) {
-    const form = await page.$('form');
-    if (form) await page.evaluate(() => { const form = document.querySelector('form'); if (form) (form as HTMLFormElement).requestSubmit(); });
-  }
+  }, account);
 }
 
-async function openLogin(page: Page, account: AccountKind, pronoteUrl: string): Promise<void> {
-  const direct = account === 'parent' ? PARENT_START : STUDENT_START;
-  await page.goto(direct, { waitUntil: 'domcontentloaded', timeout: 20000 });
-  await page.waitForSelector('input[type="password"], input[name="username"], input#username, input[type="email"]', { timeout: 12000 }).catch(() => {});
-  let text = await pageText(page);
-  if (!blocked(text) && !page.url().includes('assistance.phm.education.gouv.fr')) {
-    const hasForm = await page.$('input[type="password"], input[name="username"], input#username, input[type="email"]');
-    if (hasForm) return;
-    const fields = await page.evaluate(() => [...document.querySelectorAll('input')].slice(0, 8).map(input => `${input.type}:${input.name || input.id || 'unnamed'}`));
-    throw new ApiError('EDUCONNECT_FORM', 502, 'educonnect', `Formulaire EduConnect inattendu (${fields.join(', ') || 'aucun champ'}).`);
-  }
-  // Some establishments expose EduConnect only from the Pronote/ENT screen.
-  await page.goto(pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+async function openFromEstablishment(page: Page, input: { pronoteUrl: string; account: AccountKind }): Promise<void> {
+  await page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+  const wanted = input.account === 'parent' ? 'relative' : 'student';
   const clicked = await page.evaluate((kind: string) => {
-    const wanted = kind === 'parent' ? 'relative' : 'student';
-    const link = document.querySelector<HTMLAnchorElement>(`a[href*="saml/authn/${wanted}"], a[href*="educonnect"]`);
+    const link = document.querySelector<HTMLAnchorElement>(`a[href*="saml/authn/${kind}"]`)
+      || document.querySelector<HTMLAnchorElement>('a[href*="educonnect"], a[href*="EduConnect"]');
     if (link) { link.click(); return true; }
     const button = Array.from(document.querySelectorAll<HTMLElement>('a,button')).find(el => /educonnect/i.test(el.innerText || el.getAttribute('aria-label') || ''));
     if (button) { button.click(); return true; }
     return false;
-  }, account);
-  if (!clicked) throw new ApiError('EDUCONNECT_UNAVAILABLE', 503, 'educonnect', 'EduConnect est momentanément inaccessible ou non proposé par cet établissement.');
-  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {});
-  text = await pageText(page);
-  if (blocked(text) || page.url().includes('assistance.phm.education.gouv.fr')) {
-    throw new ApiError('EDUCONNECT_UNAVAILABLE', 503, 'educonnect', 'Le service EduConnect refuse actuellement cette connexion (maintenance ou réseau filtré). Réessayez plus tard.');
+  }, wanted);
+  if (!clicked) {
+    const hub = `https://hubeduconnect.index-education.net/EduConnect/cas/login?service=${encodeURIComponent(input.pronoteUrl)}`;
+    await page.goto(hub, { waitUntil: 'domcontentloaded', timeout: 15000 });
+  } else {
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {});
   }
+  const text = await textOf(page);
+  if (blocked(text) || page.url().includes('assistance.phm.education.gouv.fr')) {
+    throw new ApiError('EDUCONNECT_UNAVAILABLE', 503, 'educonnect', 'EduConnect refuse actuellement cette connexion. Réessayez plus tard.');
+  }
+  if (/n'est pas une url de confiance|pas une url de confiance/i.test(text)) {
+    throw new ApiError('EDUCONNECT_UNAVAILABLE', 503, 'educonnect', 'Cet établissement ne propose pas EduConnect pour cet espace Pronote.');
+  }
+}
+
+async function assertProgress(page: Page): Promise<'done' | 'continue'> {
+  const text = await textOf(page);
+  if (blocked(text) || page.url().includes('assistance.phm.education.gouv.fr')) {
+    throw new ApiError('EDUCONNECT_UNAVAILABLE', 503, 'educonnect', 'EduConnect est temporairement indisponible.');
+  }
+  if (/code (?:de )?vérification|double authentification|authentification forte|saisissez le code/i.test(text)) {
+    throw new ApiError('EDUCONNECT_MFA_REQUIRED', 409, 'educonnect', 'EduConnect demande une validation supplémentaire. Cette étape n’est pas contournée.');
+  }
+  if (/changer (?:votre |le )?mot de passe|conditions d’utilisation|conditions d'utilisation|activer (?:votre |mon )?compte/i.test(text)) {
+    throw new ApiError('EDUCONNECT_ACTION_REQUIRED', 409, 'educonnect', 'Une action est requise sur EduConnect avant de pouvoir ouvrir Pronote.');
+  }
+  if (/identifiant ou mot de passe|mot de passe incorrect|identifiants? invalides?|échec de l.?authentification|authentication failed/i.test(text)) {
+    throw new ApiError('EDUCONNECT_AUTH_FAILED', 401, 'educonnect', 'Identifiant ou mot de passe EduConnect refusé.');
+  }
+  const host = new URL(page.url()).hostname;
+  if (host.endsWith('index-education.net') && !host.startsWith('hubeduconnect.')) return 'done';
+  return 'continue';
 }
 
 export async function loginEduConnect(page: Page, input: { username: string; password: string; pronoteUrl: string; account: AccountKind }): Promise<Person> {
   try {
-  await openLogin(page, input.account, input.pronoteUrl);
-  for (let step = 0; step < 5; step++) {
-    const text = await pageText(page);
-    if (blocked(text)) throw new ApiError('EDUCONNECT_UNAVAILABLE', 503, 'educonnect', 'Le service EduConnect est temporairement indisponible.');
-    if (/code (?:de )?vérification|double authentification|authentification forte|saisissez le code/i.test(text)) {
-      throw new ApiError('EDUCONNECT_MFA_REQUIRED', 409, 'educonnect', 'EduConnect demande une validation supplémentaire. Cette étape n’est pas contournée.');
+    await openFromEstablishment(page, input);
+    for (let step = 0; step < 8; step++) {
+      if (await assertProgress(page) === 'done') break;
+      const hasPassword = await page.$(PASSWORD_SELECTOR);
+      const hasUser = await page.$(USER_SELECTOR);
+      if (!hasPassword && !hasUser) {
+        if (await chooseAccount(page, input.account)) {
+          await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => {});
+          continue;
+        }
+        if (await clickSubmit(page)) {
+          await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => {});
+          continue;
+        }
+        break;
+      }
+      if (hasUser) await fill(page, USER_SELECTOR, input.username);
+      if (hasPassword) await fill(page, PASSWORD_SELECTOR, input.password);
+      await clickSubmit(page);
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
+      await page.waitForSelector(`${PASSWORD_SELECTOR}, ${USER_SELECTOR}`, { timeout: 2500 }).catch(() => {});
     }
-    if (/identifiant ou mot de passe|mot de passe incorrect|identifiants? invalides?|échec de l.?authentification/i.test(text)) {
-      throw new ApiError('EDUCONNECT_AUTH_FAILED', 401, 'educonnect', 'Identifiant ou mot de passe EduConnect refusé.');
+    if (!new URL(page.url()).hostname.endsWith('index-education.net') || new URL(page.url()).hostname.startsWith('hubeduconnect.')) {
+      const cas = `https://ent77.seine-et-marne.fr/cas/login?service=${encodeURIComponent(input.pronoteUrl)}`;
+      await page.goto(cas, { waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {});
+    }
+    if (!new URL(page.url()).hostname.endsWith('index-education.net')) {
+      await page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 12000 });
     }
     const host = new URL(page.url()).hostname;
-    if (host.endsWith('index-education.net')) break;
-    if (host.endsWith('seine-et-marne.fr') && !page.url().includes('/auth/')) break;
-    const hasPassword = await page.$('input[type="password"]');
-    const hasUser = await page.$('input[name="username"], input#username, input[name="j_username"], input[type="email"], input[name="email"]');
-    if (!hasPassword && hasUser) {
-      await fill(page, 'input[name="username"], input#username, input[name="j_username"], input[type="email"], input[name="email"]', input.username);
-      await clickSubmit(page);
-      await page.waitForSelector('input[type="password"]', { timeout: 8000 }).catch(() => {});
-      continue;
+    if (!host.endsWith('index-education.net')) {
+      throw new ApiError('EDUCONNECT_AUTH_FAILED', 401, 'educonnect', 'La session EduConnect n’a pas ouvert l’espace Pronote.');
     }
-    if (hasPassword) {
-      if (hasUser) await fill(page, 'input[name="username"], input#username, input[name="j_username"], input[type="email"], input[name="email"]', input.username);
-      await fill(page, 'input[type="password"]', input.password);
-      await clickSubmit(page);
-      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {});
-      continue;
-    }
-    const advanced = await page.evaluate(() => {
-      const next = Array.from(document.querySelectorAll<HTMLElement>('a,button')).find(el => /continuer|accéder|acceder|élève|eleve|valider/i.test(el.innerText || ''));
-      if (!next) return false;
-      next.click();
-      return true;
-    });
-    if (!advanced) break;
-    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => {});
-  }
-  if (!new URL(page.url()).hostname.endsWith('index-education.net')) {
-    await page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-  }
-  return { nomComplet: '', prenom: '', nom: '', classe: null, etablissement: null };
+    return { nomComplet: '', prenom: '', nom: '', classe: null, etablissement: null };
   } catch (error) {
     if (error instanceof ApiError) throw error;
-    const host = (() => { try { return new URL(page.url()).hostname; } catch { return 'unknown'; } })();
-    throw new ApiError('EDUCONNECT_NAVIGATION', 502, 'educonnect', `Navigation EduConnect interrompue sur ${host}.`);
+    throw new ApiError('EDUCONNECT_NAVIGATION', 502, 'educonnect', 'Navigation EduConnect interrompue.');
   }
 }

@@ -150,12 +150,7 @@ const errorCodes: [code: string, http: string, description: string][] = [
   ['INVALID_JSON', '400', 'Le corps n’est pas un JSON valide.'],
   ['INVALID_URL', '400', 'pronoteUrl n’est pas une URL exploitable.'],
   ['FORBIDDEN_HOST', '400', 'pronoteUrl ne désigne pas un espace élève HTTPS hébergé sur index-education.net, ou l’URL contient un port, une requête ou des identifiants.'],
-  ['UNSUPPORTED_PROVIDER', '400', 'provider doit valoir ent77 ou educonnect.'],
-  ['UNSUPPORTED_ACCOUNT', '400', 'account doit valoir student ou parent.'],
-  ['UNSUPPORTED_ENT', '400', 'entUrl ne correspond pas à un portail pris en charge pour ce mode.'],
-  ['EDUCONNECT_AUTH_FAILED', '401', 'Identifiant ou mot de passe EduConnect refusé.'],
-  ['EDUCONNECT_MFA_REQUIRED', '409', 'EduConnect demande une validation supplémentaire. Elle n’est pas contournée.'],
-  ['EDUCONNECT_UNAVAILABLE', '503', 'EduConnect est indisponible, filtré ou non proposé par l’établissement.'],
+  ['UNSUPPORTED_ENT', '400', 'entUrl ne correspond pas à un ENT pris en charge.'],
   ['INVALID_MODULES', '400', 'La liste modules est vide, trop longue ou contient une rubrique inconnue.'],
   ['INVALID_CONTENT_TYPE', '415', 'Content-Type n’est pas application/json.'],
   ['BODY_TOO_LARGE', '413', 'Corps de requête supérieur à 8 Kio.'],
@@ -200,7 +195,7 @@ const limits: [topic: string, value: string, behavior: string][] = [
   ['Bail d’un job', '3 minutes', 'Un job interrompu est explicitement en échec.'],
   ['Session du moteur', '260 minutes', 'Dans un job GitHub Actions de 300 minutes.'],
   ['Heartbeat moteur', 'Valable 65 secondes', 'Protocole v5 exigé.'],
-  ['Attente synchrone', '1,5 seconde', 'Puis 202 avec jobId et jobToken, pour ne pas faire expirer le navigateur.'],
+  ['Attente synchrone', '16 secondes', 'Puis 202 avec jobId et jobToken.'],
   ['Suivi recommandé', 'Toutes les 3 secondes', 'Arrêtez dès que le statut HTTP n’est plus 202.'],
   ['Nettoyage', 'Chaque minute', 'Alarme du Durable Object. Aucun cron Worker.'],
   ['Rubriques', '8 modules', 'Statuts ok, empty, unavailable ou error.'],
@@ -470,8 +465,10 @@ ${table(['En-tête', 'Quand', 'Description'], [
 <section id="request">
 <h2>Corps de requête</h2>
 ${table(['Champ', 'Type', 'Description'], [
-  ['username', 'string · requis', 'Identifiant ENT. 200 caractères maximum.'],
-  ['password', 'string · requis', 'Mot de passe ENT. 200 caractères maximum.'],
+  ['username', 'string · requis', 'Identifiant ENT77 ou EduConnect. 200 caractères maximum.'],
+  ['password', 'string · requis', 'Mot de passe correspondant. 200 caractères maximum.'],
+  ['provider', 'string · facultatif', 'ent77 par défaut, ou educonnect. EduConnect suit le lien officiel de l’établissement puis revient sur Pronote.'],
+  ['account', 'string · facultatif', 'student par défaut, ou parent. Utilisé uniquement pour choisir le profil EduConnect.'],
   ['modules', 'string[] · facultatif', 'Rubriques à extraire. Par défaut les 8. Doublons ignorés, 8 maximum.'],
   ['pronoteUrl', 'string · facultatif', 'Espace élève HTTPS sur index-education.net, chemin exact /pronote/eleve.html, sans port, requête ni identifiant.'],
   ['entUrl', 'string · facultatif', 'https://ent.seine-et-marne.fr/ ou https://ent77.seine-et-marne.fr/ uniquement.'],
@@ -489,7 +486,7 @@ ${'{\n  "username": "prenom.nom",\n  "password": "••••••••"\n}'}
 <ol>
 <li>Vous envoyez <code>POST /api/v1/scrape-pronote</code>.</li>
 <li>Le Worker chiffre la demande et la met en file, puis démarre un moteur si aucun n’est en ligne.</li>
-<li>Il répond en 1,5 seconde. Si l’extraction n’est pas terminée, vous recevez <code>202</code> avec <code>jobId</code> et <code>jobToken</code> ; le suivi continue automatiquement.</li>
+<li>Il attend jusqu’à 16 secondes. Si le résultat arrive, vous recevez directement <code>200</code> (ou <code>401</code> / <code>502</code> selon le cas).</li>
 <li>Sinon vous recevez <code>202</code> avec <code>jobId</code>, <code>jobToken</code> et <code>statusUrl</code>. <strong>Le traitement continue.</strong></li>
 <li>Vous interrogez <code>GET /api/v1/job/&lt;jobId&gt;</code> avec <code>X-Job-Token</code> toutes les 3 secondes.</li>
 <li>Dès que le statut HTTP n’est plus <code>202</code>, vous avez le résultat. Appelez <code>DELETE</code> pour l’effacer immédiatement.</li>
@@ -544,7 +541,7 @@ ${table(['Sujet', 'Limite', 'Comportement'], limits.map(l => [esc(l[0]), esc(l[1
 </ul>
 <h3>Limites fonctionnelles assumées</h3>
 <ul>
-<li>Deux connexions : <strong>ENT77</strong> (rapide, formulaire local) et <strong>EduConnect</strong> (élève ou parent, parcours SAML officiel). La double authentification et les actions obligatoires renvoient une erreur explicite : elles ne sont pas contournées.</li>
+<li>Connexion locale ENT77 et espace <strong>élève</strong> uniquement. EduConnect, double authentification ou action obligatoire renvoient une erreur explicite : ces contrôles ne sont jamais contournés.</li>
 <li>Lecture limitée aux vues réellement chargées : la semaine affichée, la période sélectionnée. Ce n’est pas une garantie de l’année scolaire complète.</li>
 <li><code>data.eleve</code> décrit le titulaire du compte ENT, pas nécessairement l’élève si le compte est un compte parent ou personnel.</li>
 <li>Aucune écriture : pas de devoir marqué fait, pas de message marqué lu, aucun paramètre modifié.</li>
@@ -558,10 +555,12 @@ ${table(['Sujet', 'Limite', 'Comportement'], limits.map(l => [esc(l[0]), esc(l[1
 <div class="warn"><strong>Attention.</strong> Le résultat contient des données scolaires réelles. Il reste accessible avec le jeton pendant cinq minutes. Utilisez le bouton de suppression dès que vous avez terminé, et n’entrez que des identifiants que vous êtes autorisé à utiliser.</div>
 <form class="form" id="pg" autocomplete="off">
 <div class="frow">
-<label>Connexion<select id="provider"><option value="educonnect">EduConnect</option><option value="ent77">ENT77</option></select></label>
-<label>Profil EduConnect<select id="account"><option value="student">Élève</option><option value="parent">Parent</option></select></label>
-<label>Identifiant<input type="text" id="u" placeholder="prenom.nom" autocomplete="off" spellcheck="false"></label>
+<label>Identifiant ENT<input type="text" id="u" placeholder="prenom.nom" autocomplete="off" spellcheck="false"></label>
 <label>Mot de passe<input type="password" id="p" placeholder="••••••••" autocomplete="new-password"></label>
+</div>
+<div class="frow">
+<label>Connexion<select id="provider"><option value="ent77">ENT77</option><option value="educonnect">EduConnect</option></select></label>
+<label>Profil EduConnect<select id="account"><option value="student">Élève</option><option value="parent">Parent</option></select></label>
 </div>
 <div class="frow">
 <label>Clé API <small>laisser vide si non configurée</small><input type="password" id="k" placeholder="facultatif" autocomplete="off"></label>

@@ -149,10 +149,10 @@
     show("…", "Connexion a la passerelle.");
 
     var payload = { username: username, password: password, modules: mods };
-    var providerEl = document.getElementById("provider");
-    var accountEl = document.getElementById("account");
-    if (providerEl && providerEl.value) payload.provider = providerEl.value;
-    if (accountEl && accountEl.value) payload.account = accountEl.value;
+    var provider = document.getElementById("provider");
+    var account = document.getElementById("account");
+    if (provider && provider.value) payload.provider = provider.value;
+    if (account && account.value) payload.account = account.value;
     if (urlInput.value.trim()) payload.pronoteUrl = urlInput.value.trim();
 
     // Le mot de passe quitte le champ des que la requete part, meme si elle echoue.

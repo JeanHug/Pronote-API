@@ -16,9 +16,9 @@ async function main() {
       account: 'student',
       pronoteUrl: 'https://0771068t.index-education.net/pronote/eleve.html',
     });
-    const host = new URL(page.url()).hostname;
-    const ready = host.endsWith('index-education.net');
-    console.log(JSON.stringify({ event: ready ? 'EDUCONNECT_REACHED_PRONOTE' : 'EDUCONNECT_SESSION_OPEN', host, elapsedMs: Date.now() - started }));
+    const current = new URL(page.url());
+    const ready = current.hostname.endsWith('index-education.net') && !current.hostname.startsWith('hubeduconnect.');
+    console.log(JSON.stringify({ event: ready ? 'EDUCONNECT_REACHED_PRONOTE' : 'EDUCONNECT_SESSION_OPEN', host: current.hostname, path: current.pathname, elapsedMs: Date.now() - started }));
     process.exitCode = ready ? 0 : 1;
   } catch (error) {
     const code = error instanceof Error && 'code' in error ? String((error as { code?: string }).code) : 'EDUCONNECT_ERROR';

@@ -203,7 +203,9 @@ export async function extractPronote(input: Credentials, progress: (stage: strin
   let stage = 'ent';
   try {
     progress(input.provider);
-    await ensureBrowser();
+    const browserReady = ensureBrowser();
+    const entAuth = input.provider === 'educonnect' ? null : authenticate(input, controller.signal);
+    await browserReady;
     const browser = await ensureBrowser();
     context = await browser.createBrowserContext();
     const session = context;
@@ -215,7 +217,8 @@ export async function extractPronote(input: Credentials, progress: (stage: strin
       finally { await login.close().catch(() => {}); }
     } else {
       stage = 'ent';
-      const auth = await authenticate(input, controller.signal);
+      const auth = await entAuth;
+      if (!auth) throw new ApiError('INTERNAL_ERROR', 500, 'ent', 'Authentification ENT non préparée.');
       person = auth.person;
       await attachCookies(session, auth.jar);
     }
@@ -228,8 +231,8 @@ export async function extractPronote(input: Credentials, progress: (stage: strin
     const reports = new Map<ModuleName, ModuleReport>();
     const pages = await Promise.all(input.modules.map(() => preparePage(session)));
     try {
-      await Promise.all(pages.map(page => page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 12000 })));
-      const ready = await Promise.all(pages.map(page => waitPronoteReady(page, 9000)));
+      await Promise.all(pages.map(page => page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 10000 })));
+      const ready = await Promise.all(pages.map(page => waitPronoteReady(page, 7000)));
       if (!ready.some(Boolean) || pages.every(page => new URL(page.url()).hostname !== new URL(input.pronoteUrl).hostname)) {
         throw new ApiError('PRONOTE_AUTH_FAILED', 401, 'pronote', 'La session ENT est valide mais l’espace élève Pronote n’a pas été ouvert.');
       }
