@@ -1,0 +1,16 @@
+name: os diag
+on: { workflow_dispatch: {} }
+jobs:
+  win:
+    runs-on: windows-latest
+    steps:
+      - shell: pwsh
+        run: |
+          try { (Invoke-WebRequest -Uri "https://ipinfo.io/json" -UseBasicParsing).Content } catch { $_.Exception.Message }
+          try { $r=Invoke-WebRequest -Uri "https://ent77.seine-et-marne.fr/auth/saml/authn/student" -MaximumRedirection 5 -UseBasicParsing; "WIN_FINAL: $($r.BaseResponse.ResponseUri)" } catch { "WIN_ERR: $($_.Exception.Message)" }
+  mac:
+    runs-on: macos-14
+    steps:
+      - run: |
+          curl -s https://ipinfo.io/json
+          curl -sL -o /tmp/p.html -w "MAC_HTTP:%{http_code} URL:%{url_effective}\n" "https://ent77.seine-et-marne.fr/auth/saml/authn/student"; grep -o "Connexion élève - ÉduConnect\|Accès perturbé" /tmp/p.html | head -1 || true
