@@ -22,7 +22,8 @@ async function main() {
     process.exitCode = ready ? 0 : 1;
   } catch (error) {
     const code = error instanceof Error && 'code' in error ? String((error as { code?: string }).code) : 'EDUCONNECT_ERROR';
-    console.log(JSON.stringify({ event: 'EDUCONNECT_CHECK', code, elapsedMs: Date.now() - started }));
+    const message = error instanceof Error ? error.message.replaceAll(password, '[REDACTED]').slice(0, 180) : 'unknown';
+    console.log(JSON.stringify({ event: 'EDUCONNECT_CHECK', code, name: error instanceof Error ? error.name : 'unknown', message, elapsedMs: Date.now() - started }));
     process.exitCode = code === 'EDUCONNECT_UNAVAILABLE' ? 2 : 1;
   } finally {
     await browser.close().catch(() => {});

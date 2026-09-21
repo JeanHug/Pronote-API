@@ -68,6 +68,7 @@ async function openLogin(page: Page, account: AccountKind, pronoteUrl: string): 
 }
 
 export async function loginEduConnect(page: Page, input: { username: string; password: string; pronoteUrl: string; account: AccountKind }): Promise<Person> {
+  try {
   await openLogin(page, input.account, input.pronoteUrl);
   for (let step = 0; step < 5; step++) {
     const text = await pageText(page);
@@ -109,4 +110,9 @@ export async function loginEduConnect(page: Page, input: { username: string; pas
     await page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
   }
   return { nomComplet: '', prenom: '', nom: '', classe: null, etablissement: null };
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    const host = (() => { try { return new URL(page.url()).hostname; } catch { return 'unknown'; } })();
+    throw new ApiError('EDUCONNECT_NAVIGATION', 502, 'educonnect', `Navigation EduConnect interrompue sur ${host}.`);
+  }
 }
