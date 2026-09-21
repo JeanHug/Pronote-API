@@ -195,7 +195,7 @@ const limits: [topic: string, value: string, behavior: string][] = [
   ['Bail d’un job', '3 minutes', 'Un job interrompu est explicitement en échec.'],
   ['Session du moteur', '260 minutes', 'Dans un job GitHub Actions de 300 minutes.'],
   ['Heartbeat moteur', 'Valable 65 secondes', 'Protocole v5 exigé.'],
-  ['Attente synchrone', '16 secondes', 'Puis 202 avec jobId et jobToken.'],
+  ['Première réponse', '1,5 seconde', 'Puis 202 avec jobId et jobToken si l’extraction continue. Évite les coupures navigateur vers 8 secondes.'],
   ['Suivi recommandé', 'Toutes les 3 secondes', 'Arrêtez dès que le statut HTTP n’est plus 202.'],
   ['Nettoyage', 'Chaque minute', 'Alarme du Durable Object. Aucun cron Worker.'],
   ['Rubriques', '8 modules', 'Statuts ok, empty, unavailable ou error.'],
@@ -266,7 +266,6 @@ const page = `<!doctype html>
 <title>Pronote API ${VERSION} — Documentation</title>
 <meta name="description" content="Documentation complète de l’API Pronote ${VERSION} : endpoints, référence exhaustive du JSON, codes d’erreur, limites et playground.">
 <link rel="canonical" href="${PAGES}">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f6b56'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='17' font-weight='700' fill='white' text-anchor='middle'%3EP%3C/text%3E%3C/svg%3E">
 <style>
 :root{--ink:#16191c;--body:#3d444d;--soft:#6b7480;--line:#e6e9ed;--line2:#f0f2f5;--bg:#fff;--code:#f7f8fa;--accent:#0f6b56;--accent2:#0b5443;--warn:#8a5a00;--warnbg:#fff8e8;--warnline:#f0dfae;--err:#a33a3a;--monospace:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace}
 *{box-sizing:border-box}
@@ -484,9 +483,9 @@ ${'{\n  "username": "prenom.nom",\n  "password": "••••••••"\n}'}
 <ol>
 <li>Vous envoyez <code>POST /api/v1/scrape-pronote</code>.</li>
 <li>Le Worker chiffre la demande et la met en file, puis démarre un moteur si aucun n’est en ligne.</li>
-<li>Il attend jusqu’à 16 secondes. Si le résultat arrive, vous recevez directement <code>200</code> (ou <code>401</code> / <code>502</code> selon le cas).</li>
+<li>Il répond en moins de 2 secondes, pour que le navigateur ne coupe pas la connexion. Si l’extraction est déjà finie, vous recevez <code>200</code>.</li>
 <li>Sinon vous recevez <code>202</code> avec <code>jobId</code>, <code>jobToken</code> et <code>statusUrl</code>. <strong>Le traitement continue.</strong></li>
-<li>Vous interrogez <code>GET /api/v1/job/&lt;jobId&gt;</code> avec <code>X-Job-Token</code> toutes les 3 secondes.</li>
+<li>Vous interrogez <code>GET /api/v1/job/&lt;jobId&gt;</code> avec <code>X-Job-Token</code> toutes les 1 à 2 secondes.</li>
 <li>Dès que le statut HTTP n’est plus <code>202</code>, vous avez le résultat. Appelez <code>DELETE</code> pour l’effacer immédiatement.</li>
 </ol>
 <h3>Codes HTTP</h3>
