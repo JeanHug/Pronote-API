@@ -67,6 +67,7 @@ export async function loginEduConnect(page: Page, input: { username: string; pas
     // then open the official EduConnect SAML entry for the selected profile.
     await page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
     await page.goto(input.account === 'parent' ? PARENT_START : STUDENT_START, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await page.waitForFunction(() => location.hostname.includes('education.gouv.fr') || !!document.querySelector('input[type="password"]'), { timeout: 15000 }).catch(() => {});
     await guard(page);
 
     for (let step = 0; step < 6; step++) {
