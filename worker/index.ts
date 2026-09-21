@@ -90,7 +90,9 @@ export class Coordinator extends DurableObject<Env> {
         const h=await this.health();
         if(!h.runnerOnline&&!await this.dispatch('request')){this.ctx.storage.sql.exec('DELETE FROM jobs WHERE id = ?',id);return json({success:false,error:{code:'RUNNER_START_FAILED',message:'Le lancement du moteur a échoué.'}},503);}
         const immediate=this.read(id);
-        if(immediate&&!immediate.result)await new Promise<void>(resolve=>{const timer=setTimeout(finish,16000);const self=this;function finish(){clearTimeout(timer);self.waiters.delete(id);resolve();}this.waiters.set(id,finish);});
+        // Return quickly. Browser connections from GitHub Pages die around 8 s
+        // if this request stays open until extraction finishes.
+        if(immediate&&!immediate.result)await new Promise<void>(resolve=>{const timer=setTimeout(finish,1500);const self=this;function finish(){clearTimeout(timer);self.waiters.delete(id);resolve();}this.waiters.set(id,finish);});
         const response=await this.snapshot(id);
         const out=await response.json<Record<string,unknown>>();
         return json({...out,jobId:id,jobToken,statusUrl:`/api/v1/job/${id}`},response.status,{'X-Job-Token':jobToken,'Retry-After':'3'});

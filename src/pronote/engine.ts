@@ -1,18 +1,13 @@
 import puppeteer, { type Browser, type BrowserContext, type Page } from 'puppeteer';
 import { CookieJar } from 'tough-cookie';
-import * as cheerio from 'cheerio';
 import { ApiError, assertNoCredentials, emptyData, safeFailure, VERSION, type Credentials, type ExtractionResult, type ModuleName, type ModuleReport, type Person, type PronoteData } from './contracts';
 import { parseTimetable, parseGrades, parseAssignments, parseResources, parseEntries } from './parsers';
+import { loginEduConnect } from './educonnect';
 
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
 const EMPTY_HINT = 'aucun(?:e)? (?:note|devoir|travail|cours|absence|retard|punition|sanction|evaluation|évaluation|information|menu|element|élément)|pas de (?:note|travail|cours|devoir)|aucun element|aucun élément';
 const CORE: ModuleName[] = ['emploiDuTemps', 'notes', 'agenda', 'ressources'];
-const allowedHost = (host: string) =>
-  host === 'ent.seine-et-marne.fr' ||
-  host === 'ent77.seine-et-marne.fr' ||
-  host === 'educonnect.education.gouv.fr' ||
-  host === 'assistance.phm.education.gouv.fr' ||
-  /^[a-z0-9-]+\.index-education\.net$/i.test(host);
+const allowedHost = (host: string) => host === 'ent.seine-et-marne.fr' || host === 'ent77.seine-et-marne.fr' || /^[a-z0-9-]+\.index-education\.net$/i.test(host);
 
 const navigation: Record<ModuleName, { parent: string[]; sub: string[]; selector: string; scope: string }> = {
   emploiDuTemps: { parent: ['Vie scolaire', 'Emploi du temps'], sub: ['Emploi du temps'], selector: '.cours-simple', scope: 'Semaine affichée par Pronote' },
@@ -35,31 +30,21 @@ export async function closeSharedBrowser(): Promise<void> {
   await current?.close().catch(() => {});
 }
 
-async function ensureBrowser(proxyUrl?: string): Promise<Browser> {
-  if (sharedBrowser && !proxyUrl && Date.now() - sharedBrowserAt < 30 * 60_000) {
+async function ensureBrowser(): Promise<Browser> {
+  if (sharedBrowser && Date.now() - sharedBrowserAt < 25 * 60_000) {
     try {
       await sharedBrowser.pages();
       return sharedBrowser;
     } catch { await closeSharedBrowser(); }
   }
-  const args = [
-    '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-    '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
-    '--disable-backgrounding-occluded-windows', '--mute-audio', '--no-first-run',
-    '--disable-extensions', '--disable-component-update',
-  ];
-  if (proxyUrl) args.push(`--proxy-server=${proxyUrl}`);
-  const b = await puppeteer.launch({
+  sharedBrowser = await puppeteer.launch({
     headless: true,
-    timeout: 10000,
-    args,
+    timeout: 12000,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--mute-audio', '--no-first-run'],
     defaultViewport: { width: 1280, height: 900 },
   });
-  if (!proxyUrl) {
-    sharedBrowser = b;
-    sharedBrowserAt = Date.now();
-  }
-  return b;
+  sharedBrowserAt = Date.now();
+  return sharedBrowser;
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
@@ -69,58 +54,32 @@ function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T
   });
 }
 
-function extractPerson(user: Record<string, unknown>): Person {
-  const firstName = typeof user.firstName === 'string' ? user.firstName : '';
-  const lastName = typeof user.lastName === 'string' ? user.lastName : '';
-  return {
-    nomComplet: `${firstName} ${lastName}`.trim(),
-    prenom: firstName,
-    nom: lastName,
-    classe: Array.isArray(user.classNames) && typeof user.classNames[0] === 'string' ? user.classNames[0] : null,
-    etablissement: Array.isArray(user.structureNames) && typeof user.structureNames[0] === 'string' ? user.structureNames[0] : null,
-  };
-}
-
-/** Fast HTTP requester with cookie jar */
-function createHttpAgent(jar: CookieJar, signal: AbortSignal) {
-  return async function request(url: string, init: RequestInit = {}): Promise<{ body: string; status: number; finalUrl: string }> {
-    let currentUrl = url;
-    for (let count = 0; count < 12; count++) {
-      const target = new URL(currentUrl);
-      if (target.protocol !== 'https:' || !allowedHost(target.hostname) || target.port) {
-        throw new ApiError('UNSUPPORTED_REDIRECT', 502, 'ent', 'Redirection ENT hors des domaines autorisés.');
-      }
+async function authenticate(input: Credentials, signal: AbortSignal) {
+  const jar = new CookieJar();
+  async function request(url: string, init: RequestInit = {}): Promise<{ body: string; status: number }> {
+    for (let count = 0; count < 10; count++) {
+      const target = new URL(url);
+      if (target.protocol !== 'https:' || !allowedHost(target.hostname) || target.port) throw new ApiError('UNSUPPORTED_REDIRECT', 502, 'ent', 'Redirection ENT hors des domaines autorisés.');
       const headers = new Headers(init.headers);
       headers.set('User-Agent', UA);
-      headers.set('Cookie', await jar.getCookieString(currentUrl));
-      const response = await fetch(currentUrl, {
-        ...init,
-        headers,
-        redirect: 'manual',
-        signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]),
-      });
-      for (const cookie of response.headers.getSetCookie()) await jar.setCookie(cookie, currentUrl);
+      headers.set('Cookie', await jar.getCookieString(url));
+      const response = await fetch(url, { ...init, headers, redirect: 'manual', signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]) });
+      for (const cookie of response.headers.getSetCookie()) await jar.setCookie(cookie, url);
       const location = response.headers.get('location');
       if (location && response.status >= 300 && response.status < 400) {
-        const next = new URL(location, currentUrl);
-        if ([307, 308].includes(response.status) && next.origin !== target.origin && init.body) {
-          throw new ApiError('UNSAFE_REDIRECT', 502, 'ent', 'Une redirection avec identifiants a été bloquée.');
-        }
-        currentUrl = next.href;
+        const next = new URL(location, url);
+        if ([307, 308].includes(response.status) && next.origin !== target.origin && init.body) throw new ApiError('UNSAFE_REDIRECT', 502, 'ent', 'Une redirection avec identifiants a été bloquée.');
+        url = next.href;
         if (![307, 308].includes(response.status)) init = {};
         await response.body?.cancel();
         continue;
       }
       const body = await response.text();
-      return { body, status: response.status, finalUrl: currentUrl };
+      if (body.length > 2_000_000) throw new ApiError('UPSTREAM_TOO_LARGE', 502, 'ent', 'Réponse ENT anormalement volumineuse.');
+      return { body, status: response.status };
     }
     throw new ApiError('REDIRECT_LIMIT', 502, 'ent', 'Trop de redirections ENT.');
-  };
-}
-
-/** Local ENT77 Authentication (fast, direct HTTP form) */
-async function authenticateLocal(input: Credentials, signal: AbortSignal, jar: CookieJar): Promise<Person> {
-  const request = createHttpAgent(jar, signal);
+  }
   await request('https://ent.seine-et-marne.fr/');
   await request('https://ent77.seine-et-marne.fr/auth/login', {
     method: 'POST',
@@ -129,156 +88,21 @@ async function authenticateLocal(input: Credentials, signal: AbortSignal, jar: C
   });
   const session = await request('https://ent77.seine-et-marne.fr/auth/oauth2/userinfo');
   let user: Record<string, unknown>;
-  try { user = JSON.parse(session.body) as Record<string, unknown>; } catch {
-    throw new ApiError('ENT_AUTH_FAILED', 401, 'ent', 'La connexion ENT n’a pas été confirmée. Vérifiez vos identifiants.');
-  }
-  if (session.status !== 200 || !user.userId) {
-    throw new ApiError('ENT_AUTH_FAILED', 401, 'ent', 'Identifiant ou mot de passe ENT incorrect.');
-  }
-  if (user.forceChangePassword || user.needRevalidateTerms) {
-    throw new ApiError('ENT_ACTION_REQUIRED', 409, 'ent', 'Une action est requise sur le portail ENT : mot de passe ou conditions d’utilisation.');
-  }
-  return extractPerson(user);
-}
-
-/** EduConnect SAML Authentication (supporting both student & parent profiles) */
-async function authenticateEduConnect(input: Credentials, signal: AbortSignal, jar: CookieJar): Promise<Person> {
-  const request = createHttpAgent(jar, signal);
-  const isParent = input.authMode === 'educonnect_parent';
-  const startEndpoint = isParent
-    ? 'https://ent77.seine-et-marne.fr/auth/saml/authn/relative'
-    : 'https://ent77.seine-et-marne.fr/auth/saml/authn/student';
-
-  // 1. Initiate SAML Request on ENT77 -> redirects to EduConnect
-  const samlInit = await request(startEndpoint);
-
-  // Check if EduConnect WAF redirected to "assistance" (VPN / foreign / datacenter IP block)
-  if (samlInit.finalUrl.includes('assistance.phm.education.gouv.fr') || samlInit.body.includes('accès perturbé') || samlInit.body.includes('difficultés techniques')) {
-    throw new ApiError(
-      'EDUCONNECT_GEOBLOCKED',
-      403,
-      'ent',
-      'EduConnect a bloqué la connexion (accès perturbé : IP hébergeur/VPN détectée par le Ministère). Utilisez le mode local ENT77 ou fournissez vos cookies ENT dans sessionCookie.'
-    );
-  }
-
-  // 2. Parse EduConnect login page HTML
-  const $edu = cheerio.load(samlInit.body);
-  const formAction = $edu('form').first().attr('action') || samlInit.finalUrl;
-  const actionUrl = new URL(formAction, samlInit.finalUrl).href;
-
-  // Extract hidden inputs (csrf_token, SAMLRequest, RelayState if present)
-  const formFields: Record<string, string> = {};
-  $edu('form input[type="hidden"]').each((_, el) => {
-    const name = $edu(el).attr('name');
-    const val = $edu(el).attr('value') || '';
-    if (name) formFields[name] = val;
-  });
-
-  // EduConnect credential field names: j_username & j_password
-  formFields['j_username'] = input.username;
-  formFields['j_password'] = input.password;
-  formFields['_eventId_proceed'] = '';
-
-  // 3. Submit EduConnect credentials
-  const eduLogin = await request(actionUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Referer: samlInit.finalUrl },
-    body: new URLSearchParams(formFields),
-  });
-
-  if (eduLogin.finalUrl.includes('assistance.phm.education.gouv.fr')) {
-    throw new ApiError('EDUCONNECT_GEOBLOCKED', 403, 'ent', 'EduConnect a bloqué la connexion suite au filtrage réseau PHM.');
-  }
-
-  // Check if login failed on EduConnect
-  if (eduLogin.body.includes('Identifiant ou mot de passe incorrect') || eduLogin.body.includes('Erreur d\'authentification') || eduLogin.body.includes('j_username')) {
-    throw new ApiError('ENT_AUTH_FAILED', 401, 'ent', 'Identifiant ou mot de passe EduConnect incorrect.');
-  }
-
-  // 4. EduConnect returns a page with auto-submitting SAMLResponse form to ENT77 ACS
-  const $samlResp = cheerio.load(eduLogin.body);
-  const samlResponseVal = $samlResp('input[name="SAMLResponse"]').val();
-  const relayStateVal = $samlResp('input[name="RelayState"]').val();
-  const acsUrl = $samlResp('form').first().attr('action') || 'https://ent77.seine-et-marne.fr/auth/saml/post/sso/';
-
-  if (!samlResponseVal) {
-    throw new ApiError('EDUCONNECT_AUTH_FAILED', 401, 'ent', 'EduConnect n’a pas retourné d’assertion SAML valide.');
-  }
-
-  // 5. Post SAMLResponse back to ENT77 Assertion Consumer Service
-  await request(new URL(acsUrl, eduLogin.finalUrl).href, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Referer: eduLogin.finalUrl },
-    body: new URLSearchParams({
-      SAMLResponse: String(samlResponseVal),
-      ...(relayStateVal ? { RelayState: String(relayStateVal) } : {}),
-    }),
-  });
-
-  // 6. Verify authenticated session on ENT77
-  const session = await request('https://ent77.seine-et-marne.fr/auth/oauth2/userinfo');
-  let user: Record<string, unknown>;
-  try { user = JSON.parse(session.body) as Record<string, unknown>; } catch {
-    throw new ApiError('ENT_AUTH_FAILED', 401, 'ent', 'Session EduConnect non confirmée sur ENT77.');
-  }
-  if (session.status !== 200 || !user.userId) {
-    throw new ApiError('ENT_AUTH_FAILED', 401, 'ent', 'Échec de finalisation de la session EduConnect sur ENT77.');
-  }
-  return extractPerson(user);
-}
-
-/** Unified Authenticator: supports Direct Cookies, Local ENT77, EduConnect and Auto-detection */
-async function authenticate(input: Credentials, signal: AbortSignal): Promise<{ jar: CookieJar; person: Person; activeMode: Credentials['authMode'] }> {
-  const jar = new CookieJar();
-
-  // If caller provided session cookie directly: inject and skip login (instant ~100ms)
-  if (input.sessionCookie) {
-    const cookies = input.sessionCookie.split(';').map(s => s.trim()).filter(Boolean);
-    for (const c of cookies) {
-      await jar.setCookie(c, 'https://ent77.seine-et-marne.fr/').catch(() => {});
-      await jar.setCookie(c, 'https://ent.seine-et-marne.fr/').catch(() => {});
-    }
-    const request = createHttpAgent(jar, signal);
-    const session = await request('https://ent77.seine-et-marne.fr/auth/oauth2/userinfo').catch(() => null);
-    if (session && session.status === 200) {
-      try {
-        const u = JSON.parse(session.body) as Record<string, unknown>;
-        if (u.userId) return { jar, person: extractPerson(u), activeMode: input.authMode };
-      } catch { /* proceed */ }
-    }
-  }
-
-  // If explicit EduConnect requested
-  if (input.authMode === 'educonnect' || input.authMode === 'educonnect_eleve' || input.authMode === 'educonnect_parent') {
-    const person = await authenticateEduConnect(input, signal, jar);
-    return { jar, person, activeMode: input.authMode };
-  }
-
-  // If explicit Local ENT77 requested
-  if (input.authMode === 'local') {
-    const person = await authenticateLocal(input, signal, jar);
-    return { jar, person, activeMode: 'local' };
-  }
-
-  // Auto mode: try Local ENT77 first (instant), with fallback to EduConnect
-  try {
-    const person = await authenticateLocal(input, signal, jar);
-    return { jar, person, activeMode: 'local' };
-  } catch (localErr) {
-    // If local failed with auth error, try EduConnect
-    if (localErr instanceof ApiError && (localErr.code === 'ENT_AUTH_FAILED' || localErr.code === 'INVALID_CREDENTIALS')) {
-      try {
-        const person = await authenticateEduConnect(input, signal, jar);
-        return { jar, person, activeMode: 'educonnect_eleve' };
-      } catch (eduErr) {
-        // If EduConnect was geoblocked, throw the clean geoblock notice; otherwise throw auth failed
-        if (eduErr instanceof ApiError && eduErr.code === 'EDUCONNECT_GEOBLOCKED') throw eduErr;
-        throw localErr;
-      }
-    }
-    throw localErr;
-  }
+  try { user = JSON.parse(session.body) as Record<string, unknown>; } catch { throw new ApiError('ENT_AUTH_FAILED', 401, 'ent', 'La connexion ENT n’a pas été confirmée. Vérifiez les identifiants ou les exigences de double authentification.'); }
+  if (session.status !== 200 || !user.userId) throw new ApiError('ENT_AUTH_FAILED', 401, 'ent', 'L’ENT n’a pas accepté cette connexion.');
+  if (user.forceChangePassword || user.needRevalidateTerms) throw new ApiError('ENT_ACTION_REQUIRED', 409, 'ent', 'Une action est requise sur le portail ENT : mot de passe ou conditions d’utilisation.');
+  const firstName = typeof user.firstName === 'string' ? user.firstName : '';
+  const lastName = typeof user.lastName === 'string' ? user.lastName : '';
+  return {
+    jar,
+    person: {
+      nomComplet: `${firstName} ${lastName}`.trim(),
+      prenom: firstName,
+      nom: lastName,
+      classe: Array.isArray(user.classNames) && typeof user.classNames[0] === 'string' ? user.classNames[0] : null,
+      etablissement: Array.isArray(user.structureNames) && typeof user.structureNames[0] === 'string' ? user.structureNames[0] : null,
+    } satisfies Person,
+  };
 }
 
 async function attachCookies(context: BrowserContext, jar: CookieJar) {
@@ -295,19 +119,15 @@ async function attachCookies(context: BrowserContext, jar: CookieJar) {
   if (packed.length) await context.setCookie(...packed);
 }
 
-async function preparePage(context: BrowserContext): Promise<Page> {
+async function preparePage(context: BrowserContext, lean = true): Promise<Page> {
   const page = await context.newPage();
   await page.setUserAgent(UA);
   await page.evaluateOnNewDocument('globalThis.__name = (fn) => fn;');
-  const session = await page.createCDPSession();
-  await session.send('Network.enable');
-  await session.send('Network.setBlockedURLs', {
-    urls: [
-      '*.png', '*.jpg', '*.jpeg', '*.gif', '*.webp', '*.svg', '*.ico',
-      '*.woff', '*.woff2', '*.ttf', '*.eot', '*.mp4', '*.mp3',
-      '*analytics*', '*matomo*', '*google-analytics*', '*xiti*', '*doubleclick*'
-    ]
-  });
+  if (lean) {
+    const session = await page.createCDPSession();
+    await session.send('Network.enable');
+    await session.send('Network.setBlockedURLs', { urls: ['*.png', '*.jpg', '*.jpeg', '*.gif', '*.webp', '*.woff', '*.woff2', '*.ttf', '*.mp4', '*.mp3'] });
+  }
   return page;
 }
 
@@ -316,7 +136,7 @@ async function waitPronoteReady(page: Page, timeout: number): Promise<boolean> {
     await page.waitForFunction(() => {
       const w = window as unknown as { GApplication?: { parametresUtilisateur?: unknown }; GEtatUtilisateur?: { Identification?: unknown } };
       return !!w.GApplication?.parametresUtilisateur && !!w.GEtatUtilisateur?.Identification && document.querySelectorAll('.item-menu_niveau0').length >= 3;
-    }, { timeout, polling: 50 });
+    }, { timeout });
     return true;
   } catch { return false; }
 }
@@ -359,7 +179,7 @@ async function captureModule(page: Page, module: ModuleName, data: PronoteData, 
   const state = await page.waitForFunction((selector: string, hint: string) => {
     if (document.querySelector(selector)) return 'ready';
     return new RegExp(hint, 'i').test(document.body?.innerText || '') ? 'empty' : false;
-  }, { timeout: timeoutMs, polling: 50 }, spec.selector, EMPTY_HINT).then(handle => handle.jsonValue() as Promise<'ready' | 'empty'>).catch(() => null);
+  }, { timeout: timeoutMs }, spec.selector, EMPTY_HINT).then(handle => handle.jsonValue() as Promise<'ready' | 'empty'>).catch(() => null);
   const html = await page.content();
   const count = applyHtml(module, html, data, pronoteUrl);
   const emptyHint = state === 'empty' || (count === 0 && await page.evaluate((hint: string) => new RegExp(hint, 'i').test(document.body?.innerText || ''), EMPTY_HINT));
@@ -375,71 +195,61 @@ async function captureModule(page: Page, module: ModuleName, data: PronoteData, 
 
 export async function extractPronote(input: Credentials, progress: (stage: string) => void = () => {}): Promise<ExtractionResult> {
   const started = Date.now();
-  const authentication = { ent: false, pronote: false, authMode: input.authMode };
+  const authentication: ExtractionResult['authentication'] = { ent: false, pronote: false, provider: input.provider };
   const controller = new AbortController();
   let context: BrowserContext | undefined;
   let timedOut = false;
-  const deadline = setTimeout(() => { timedOut = true; controller.abort(); void context?.close().catch(() => {}); }, 35000);
+  const deadline = setTimeout(() => { timedOut = true; controller.abort(); void context?.close().catch(() => {}); }, 45000);
   let stage = 'ent';
   try {
-    progress('ent');
-    // Fast path: HTTP authentication and browser instance prepare in parallel
-    const [auth] = await Promise.all([
-      authenticate(input, controller.signal),
-      ensureBrowser(input.proxyUrl)
-    ]);
-    authentication.ent = true;
-    authentication.authMode = auth.activeMode;
-    stage = 'browser';
-    progress(stage);
-
-    const browser = await ensureBrowser(input.proxyUrl);
+    progress(input.provider);
+    await ensureBrowser();
+    const browser = await ensureBrowser();
     context = await browser.createBrowserContext();
-    await attachCookies(context, auth.jar);
+    const session = context;
+    let person: Person = { nomComplet: '', prenom: '', nom: '', classe: null, etablissement: null };
+    if (input.provider === 'educonnect') {
+      stage = 'educonnect';
+      const login = await preparePage(session, false);
+      try { person = await loginEduConnect(login, input); }
+      finally { await login.close().catch(() => {}); }
+    } else {
+      stage = 'ent';
+      const auth = await authenticate(input, controller.signal);
+      person = auth.person;
+      await attachCookies(session, auth.jar);
+    }
+    authentication.ent = true;
+    authentication.provider = input.provider;
 
     stage = 'pronote';
     progress(stage);
-
-    const data = emptyData(auth.person);
+    const data = emptyData(person);
     const reports = new Map<ModuleName, ModuleReport>();
-
-    // Open parallel tabs (up to 4 concurrent pages) for lightning-fast multi-rubric extraction
-    const parallelism = Math.min(4, Math.max(1, input.modules.length));
-    const pages = await Promise.all(Array.from({ length: parallelism }, () => preparePage(context!)));
-
+    const pages = await Promise.all(input.modules.map(() => preparePage(session)));
     try {
-      // Parallel navigate to Pronote
-      await Promise.all(pages.map(page => page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 8000 })));
-      const ready = await Promise.all(pages.map(page => waitPronoteReady(page, 6000)));
-
+      await Promise.all(pages.map(page => page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 12000 })));
+      const ready = await Promise.all(pages.map(page => waitPronoteReady(page, 9000)));
       if (!ready.some(Boolean) || pages.every(page => new URL(page.url()).hostname !== new URL(input.pronoteUrl).hostname)) {
-        throw new ApiError('PRONOTE_AUTH_FAILED', 401, 'pronote', 'La session ENT est valide mais l’espace élève Pronote n’a pas pu s’ouvrir.');
+        throw new ApiError('PRONOTE_AUTH_FAILED', 401, 'pronote', 'La session ENT est valide mais l’espace élève Pronote n’a pas été ouvert.');
       }
       authentication.pronote = true;
       progress('modules');
-
-      // Distribute modules across parallel pages
-      const buckets: ModuleName[][] = Array.from({ length: parallelism }, () => []);
-      input.modules.forEach((module, index) => buckets[index % parallelism].push(module));
-
-      await Promise.all(buckets.map(async (mods, index) => {
+      await Promise.all(input.modules.map(async (module, index) => {
+        const begun = Date.now();
         const page = pages[index];
         if (!ready[index]) {
-          for (const module of mods) reports.set(module, failedReport(module, Date.now()));
+          reports.set(module, failedReport(module, begun));
           return;
         }
-        for (const module of mods) {
-          reports.set(module, await withTimeout(captureModule(page, module, data, input.pronoteUrl, 1200), 2200, failedReport(module, Date.now())));
-        }
+        reports.set(module, await withTimeout(captureModule(page, module, data, input.pronoteUrl, 1600), 3500, failedReport(module, begun)));
       }));
-
-      // Rapid single-page fallback for any core module that raced
       const fallback = pages.find((_, index) => ready[index]);
       if (fallback) {
         for (const module of input.modules) {
           const report = reports.get(module);
           if (report && CORE.includes(module) && report.status === 'error') {
-            reports.set(module, await withTimeout(captureModule(fallback, module, data, input.pronoteUrl, 1400), 2000, report));
+            reports.set(module, await withTimeout(captureModule(fallback, module, data, input.pronoteUrl, 1600), 2500, report));
           }
         }
       }
@@ -457,7 +267,7 @@ export async function extractPronote(input: Credentials, progress: (stage: strin
       status: readable ? (partial ? 'partial' : 'done') : 'error',
       timestamp: new Date().toISOString(),
       durationMs: Date.now() - started,
-      authentication,
+      authentication: { ...authentication, provider: input.provider },
       modules: ordered,
       data,
       ...(!readable ? { error: { code: 'EXTRACTION_EMPTY', message: 'Aucun module demandé n’a pu être lu de façon vérifiable.', stage: 'parsing' } } : {}),
@@ -468,7 +278,7 @@ export async function extractPronote(input: Credentials, progress: (stage: strin
     return result;
   } catch (error) {
     const err = timedOut
-      ? new ApiError('EXTRACTION_TIMEOUT', 504, stage, 'L’extraction a dépassé 35 secondes.')
+      ? new ApiError('EXTRACTION_TIMEOUT', 504, stage, 'L’extraction a dépassé 45 secondes.')
       : error instanceof ApiError ? error : new ApiError('UPSTREAM_ERROR', 502, stage, 'Le traitement a été interrompu à cette étape. Aucun détail de connexion n’est exposé.');
     return safeFailure(err, Date.now() - started, authentication);
   } finally {
