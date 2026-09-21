@@ -66,7 +66,7 @@ async function openFromEstablishment(page: Page, input: { pronoteUrl: string; ac
     const hub = `https://hubeduconnect.index-education.net/EduConnect/cas/login?service=${encodeURIComponent(input.pronoteUrl)}`;
     await page.goto(hub, { waitUntil: 'domcontentloaded', timeout: 15000 });
   } else {
-    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {});
+    await page.waitForFunction(() => location.hostname.includes('education.gouv.fr') || !!document.querySelector('input[type="password"], input[name="username"]'), { timeout: 12000 }).catch(() => {});
   }
   const text = await textOf(page);
   if (blocked(text) || page.url().includes('assistance.phm.education.gouv.fr')) {
@@ -127,9 +127,13 @@ export async function loginEduConnect(page: Page, input: { username: string; pas
     if (!new URL(page.url()).hostname.endsWith('index-education.net')) {
       await page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 12000 });
     }
-    const host = new URL(page.url()).hostname;
-    if (!host.endsWith('index-education.net')) {
-      throw new ApiError('EDUCONNECT_AUTH_FAILED', 401, 'educonnect', 'La session EduConnect n’a pas ouvert l’espace Pronote.');
+    const current = new URL(page.url());
+    if (!current.hostname.endsWith('index-education.net') || current.hostname.startsWith('hubeduconnect.')) {
+      const hint = await page.evaluate(() => ({
+        password: !!document.querySelector('input[type="password"]'),
+        buttons: [...document.querySelectorAll('button,a')].map(el => (el.textContent || '').replace(/\s+/g, ' ').trim()).filter(text => text && text.length < 32).slice(0, 4),
+      })).catch(() => ({ password: false, buttons: [] }));
+      throw new ApiError('EDUCONNECT_AUTH_FAILED', 401, 'educonnect', `EduConnect n’a pas ouvert Pronote (${current.hostname}${current.pathname}; mot de passe affiché: ${hint.password ? 'oui' : 'non'}).`);
     }
     return { nomComplet: '', prenom: '', nom: '', classe: null, etablissement: null };
   } catch (error) {
