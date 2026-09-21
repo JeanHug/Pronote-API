@@ -154,18 +154,23 @@
     // Le mot de passe quitte le champ des que la requete part, meme si elle echoue.
     passInput.value = "";
 
+    var signal = controller.signal;
+    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.any === "function" && typeof AbortSignal.timeout === "function") {
+      signal = AbortSignal.any([controller.signal, AbortSignal.timeout(120000)]);
+    }
+
     call("/api/v1/scrape-pronote", {
       method: "POST",
       headers: requestHeaders(),
       body: JSON.stringify(payload),
-      signal: controller.signal
+      signal: signal
     }).then(function (res) {
       if (res.data && typeof res.data.jobId === "string") jobId = res.data.jobId;
       if (res.data && typeof res.data.jobToken === "string") jobToken = res.data.jobToken;
 
       var attempts = 0;
       function poll() {
-        if (res.status !== 202 || !jobId || attempts >= 90 || controller.signal.aborted) return finish(res);
+        if (res.status !== 202 || !jobId || attempts >= 90 || controller.signal.aborted) return res;
         attempts++;
         show("202", "Traitement en cours (" + jobId.slice(0, 8) + "…). Nouvelle tentative dans 3 s.");
         return new Promise(function (resolve) { setTimeout(resolve, 3000); }).then(function () {
@@ -187,11 +192,20 @@
       else if (res.data && res.data.error) show(String(res.status), res.data.error.code + " — " + res.data.error.message);
       else show(String(res.status), "Reponse du serveur affichee ci-contre.");
     }).catch(function (error) {
-      if (error && error.name === "AbortError") {
+      // Le detail technique reste dans la console du navigateur, jamais a l'ecran.
+      console.error("[playground]", error && error.name, error && error.message);
+      var name = error && error.name ? error.name : "Error";
+      if (name === "AbortError") {
         show("—", "Suivi arrete. Le resultat serveur expire seul apres 5 minutes.");
+      } else if (name === "TimeoutError") {
+        show("timeout", "Delai de 120 s depasse sans reponse.");
+        pane("r", '<div class="placeholder">Aucune reponse dans le delai imparti.</div>');
+      } else if (name === "TypeError") {
+        show("reseau", "Requete bloquee par le navigateur ou le reseau : CORS, bloqueur de publicite ou connexion interrompue. Verifiez la console.");
+        pane("r", '<div class="placeholder">Requete bloquee avant d\\u2019atteindre la passerelle.</div>');
       } else {
-        show("erreur", "La passerelle n'a pas repondu. Reessayez dans un instant.");
-        pane("r", '<div class="placeholder">Requete interrompue.</div>');
+        show("erreur", "Erreur inattendue dans le playground. Le detail est dans la console du navigateur.");
+        pane("r", '<div class="placeholder">Erreur d\\u2019execution du playground.</div>');
       }
     }).then(function () { setRunning(false); });
   });

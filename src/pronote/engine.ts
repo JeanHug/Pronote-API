@@ -1,21 +1,57 @@
 import puppeteer, { type Browser, type BrowserContext, type Page } from 'puppeteer';
 import { CookieJar } from 'tough-cookie';
-import { ApiError, assertNoCredentials, emptyData, safeFailure, VERSION, type Credentials, type ExtractionResult, type ModuleName, type ModuleReport, type Person } from './contracts';
+import { ApiError, assertNoCredentials, emptyData, safeFailure, VERSION, type Credentials, type ExtractionResult, type ModuleName, type ModuleReport, type Person, type PronoteData } from './contracts';
 import { parseTimetable, parseGrades, parseAssignments, parseResources, parseEntries } from './parsers';
 
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
+const EMPTY_HINT = 'aucun(?:e)? (?:note|devoir|travail|cours|absence|retard|punition|sanction|evaluation|évaluation|information|menu|element|élément)|pas de (?:note|travail|cours|devoir)|aucun element|aucun élément';
+const CORE: ModuleName[] = ['emploiDuTemps', 'notes', 'agenda', 'ressources'];
 const allowedHost = (host: string) => host === 'ent.seine-et-marne.fr' || host === 'ent77.seine-et-marne.fr' || /^[a-z0-9-]+\.index-education\.net$/i.test(host);
-const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
-/**
- * Extraire toutes les rubriques demandées EN PARALLÈLE.
- *
- * Chaque rubrique obtient SON propre contexte navigateur (Son propre espace de
- * session Pronote). Toutes les pages Pronote s'ouvrent donc en même temps, la
- * latence totale tend vers le module le plus lent au lieu de la somme des huit.
- * Les contextes sont indépendants : les sessions AngularJS ne se bloquent pas
- * mutuellement, contrairement à des onglets parallèles partageant une session.
- */
+const navigation: Record<ModuleName, { parent: string[]; sub: string[]; selector: string; scope: string }> = {
+  emploiDuTemps: { parent: ['Vie scolaire', 'Emploi du temps'], sub: ['Emploi du temps'], selector: '.cours-simple', scope: 'Semaine affichée par Pronote' },
+  notes: { parent: ['Notes'], sub: ['Mes notes'], selector: '.note-devoir', scope: 'Période sélectionnée par Pronote' },
+  agenda: { parent: ['Cahier de textes'], sub: ['Travail à faire'], selector: '.conteneur-item .titre-matiere', scope: 'Travail à faire chargé dans la vue Pronote' },
+  ressources: { parent: ['Cahier de textes'], sub: ['Contenus et ressources'], selector: '.conteneur-item', scope: 'Séances chargées dans la vue Pronote' },
+  vieScolaire: { parent: ['Vie scolaire'], sub: ['Carnet', 'Absences'], selector: '.liste_contenu_cellule_contenu,.conteneur-item', scope: 'Carnet affiché par Pronote' },
+  competences: { parent: ['Compétences'], sub: ['Mes évaluations'], selector: '.liste_contenu_cellule_contenu,.conteneur-item', scope: 'Évaluations affichées par Pronote' },
+  actualites: { parent: ['Communication'], sub: ['Informations & sondages', 'Informations et sondages'], selector: '.conteneur-item,.liste_contenu_cellule_contenu', scope: 'Liste des informations, sans marquage de lecture' },
+  cantine: { parent: ['Vie scolaire', 'Informations personnelles'], sub: ['Menus', 'Menu de la cantine'], selector: '.conteneur-item,[class*="menu-repas"]', scope: 'Menus affichés par Pronote' },
+};
+
+let sharedBrowser: Browser | undefined;
+let sharedBrowserAt = 0;
+
+export async function closeSharedBrowser(): Promise<void> {
+  const current = sharedBrowser;
+  sharedBrowser = undefined;
+  sharedBrowserAt = 0;
+  await current?.close().catch(() => {});
+}
+
+async function ensureBrowser(): Promise<Browser> {
+  if (sharedBrowser && Date.now() - sharedBrowserAt < 25 * 60_000) {
+    try {
+      await sharedBrowser.pages();
+      return sharedBrowser;
+    } catch { await closeSharedBrowser(); }
+  }
+  sharedBrowser = await puppeteer.launch({
+    headless: true,
+    timeout: 12000,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--mute-audio', '--no-first-run'],
+    defaultViewport: { width: 1280, height: 900 },
+  });
+  sharedBrowserAt = Date.now();
+  return sharedBrowser;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    promise.then(value => { clearTimeout(timer); resolve(value); }, () => { clearTimeout(timer); resolve(fallback); });
+  });
+}
 
 async function authenticate(input: Credentials, signal: AbortSignal) {
   const jar = new CookieJar();
@@ -26,7 +62,7 @@ async function authenticate(input: Credentials, signal: AbortSignal) {
       const headers = new Headers(init.headers);
       headers.set('User-Agent', UA);
       headers.set('Cookie', await jar.getCookieString(url));
-      const response = await fetch(url, { ...init, headers, redirect: 'manual', signal: AbortSignal.any([signal, AbortSignal.timeout(20000)]) });
+      const response = await fetch(url, { ...init, headers, redirect: 'manual', signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]) });
       for (const cookie of response.headers.getSetCookie()) await jar.setCookie(cookie, url);
       const location = response.headers.get('location');
       if (location && response.status >= 300 && response.status < 400) {
@@ -43,8 +79,7 @@ async function authenticate(input: Credentials, signal: AbortSignal) {
     }
     throw new ApiError('REDIRECT_LIMIT', 502, 'ent', 'Trop de redirections ENT.');
   }
-  // Pas de pré-lecture de la page d'accueil ENT : le formulaire POSTé ne
-  // requiert aucun cookie ni jeton CSRF. Un aller-retour HTTP économisé.
+  await request('https://ent.seine-et-marne.fr/');
   await request('https://ent77.seine-et-marne.fr/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'https://ent.seine-et-marne.fr', Referer: 'https://ent.seine-et-marne.fr/' },
@@ -57,26 +92,51 @@ async function authenticate(input: Credentials, signal: AbortSignal) {
   if (user.forceChangePassword || user.needRevalidateTerms) throw new ApiError('ENT_ACTION_REQUIRED', 409, 'ent', 'Une action est requise sur le portail ENT : mot de passe ou conditions d’utilisation.');
   const firstName = typeof user.firstName === 'string' ? user.firstName : '';
   const lastName = typeof user.lastName === 'string' ? user.lastName : '';
-  const person: Person = { nomComplet: `${firstName} ${lastName}`.trim(), prenom: firstName, nom: lastName, classe: Array.isArray(user.classNames) && typeof user.classNames[0] === 'string' ? user.classNames[0] : null, etablissement: Array.isArray(user.structureNames) && typeof user.structureNames[0] === 'string' ? user.structureNames[0] : null };
-  return { jar, person };
+  return {
+    jar,
+    person: {
+      nomComplet: `${firstName} ${lastName}`.trim(),
+      prenom: firstName,
+      nom: lastName,
+      classe: Array.isArray(user.classNames) && typeof user.classNames[0] === 'string' ? user.classNames[0] : null,
+      etablissement: Array.isArray(user.structureNames) && typeof user.structureNames[0] === 'string' ? user.structureNames[0] : null,
+    } satisfies Person,
+  };
 }
 
-const navigation: Record<ModuleName, { parent: string[]; sub: string[]; selector: string; scope: string }> = {
-  emploiDuTemps: { parent: ['Vie scolaire', 'Emploi du temps'], sub: ['Emploi du temps'], selector: '.cours-simple', scope: 'Semaine affichée par Pronote' },
-  notes: { parent: ['Notes'], sub: ['Mes notes'], selector: '.note-devoir', scope: 'Période sélectionnée par Pronote' },
-  agenda: { parent: ['Cahier de textes'], sub: ['Travail à faire'], selector: '.conteneur-item .titre-matiere', scope: 'Travail à faire chargé dans la vue Pronote' },
-  ressources: { parent: ['Cahier de textes'], sub: ['Contenus et ressources'], selector: '.conteneur-item', scope: 'Séances chargées dans la vue Pronote' },
-  vieScolaire: { parent: ['Vie scolaire'], sub: ['Carnet', 'Absences'], selector: '.liste_contenu_cellule_contenu,.conteneur-item', scope: 'Carnet affiché par Pronote' },
-  competences: { parent: ['Compétences'], sub: ['Mes évaluations'], selector: '.liste_contenu_cellule_contenu,.conteneur-item', scope: 'Évaluations affichées par Pronote' },
-  actualites: { parent: ['Communication'], sub: ['Informations & sondages', 'Informations et sondages'], selector: '.conteneur-item,.liste_contenu_cellule_contenu', scope: 'Liste des informations, sans marquage de lecture' },
-  cantine: { parent: ['Vie scolaire', 'Informations personnelles'], sub: ['Menus', 'Menu de la cantine'], selector: '.conteneur-item,[class*="menu-repas"]', scope: 'Menus affichés par Pronote' },
-};
+async function attachCookies(context: BrowserContext, jar: CookieJar) {
+  const seen = new Set<string>();
+  const packed = [];
+  for (const origin of ['https://ent77.seine-et-marne.fr/', 'https://ent.seine-et-marne.fr/']) {
+    for (const cookie of await jar.getCookies(origin)) {
+      const key = `${cookie.key}|${cookie.domain}|${cookie.path}`;
+      if (seen.has(key) || !cookie.domain) continue;
+      seen.add(key);
+      packed.push({ name: cookie.key, value: cookie.value, domain: cookie.domain, path: cookie.path || '/', secure: cookie.secure, httpOnly: cookie.httpOnly });
+    }
+  }
+  if (packed.length) await context.setCookie(...packed);
+}
 
-/** Marqueurs d'état vide REELLEMENT affichés par Pronote. */
-// Restreint aux formulations d'état vide de listes Pronote — les bandeaux
-// « Pas de cours aujourd'hui » de l'accueil ne doivent PAS provoquer un faux
-// « empty » sur un onglet en cours de chargement.
-const EMPTY_RE = /aucun(?:e)?\s+(?:note|devoir|travail|cours|absence|retard|punition|sanction|[eé]valuation|actualit[eé]|information|r[eé]sultat)|aucun\s+[eé]l[eé]ment|aucune\s+donn[eé]e/i;
+async function preparePage(context: BrowserContext): Promise<Page> {
+  const page = await context.newPage();
+  await page.setUserAgent(UA);
+  await page.evaluateOnNewDocument('globalThis.__name = (fn) => fn;');
+  const session = await page.createCDPSession();
+  await session.send('Network.enable');
+  await session.send('Network.setBlockedURLs', { urls: ['*.png', '*.jpg', '*.jpeg', '*.gif', '*.webp', '*.svg', '*.woff', '*.woff2', '*.ttf', '*.mp4', '*.mp3'] });
+  return page;
+}
+
+async function waitPronoteReady(page: Page, timeout: number): Promise<boolean> {
+  try {
+    await page.waitForFunction(() => {
+      const w = window as unknown as { GApplication?: { parametresUtilisateur?: unknown }; GEtatUtilisateur?: { Identification?: unknown } };
+      return !!w.GApplication?.parametresUtilisateur && !!w.GEtatUtilisateur?.Identification && document.querySelectorAll('.item-menu_niveau0').length >= 3;
+    }, { timeout });
+    return true;
+  } catch { return false; }
+}
 
 async function selectModule(page: Page, module: ModuleName): Promise<boolean> {
   const spec = navigation[module];
@@ -92,183 +152,125 @@ async function selectModule(page: Page, module: ModuleName): Promise<boolean> {
   }, { parent: spec.parent, sub: spec.sub });
 }
 
-interface InjectionCookie { name: string; value: string; domain: string; path: string; secure?: boolean; httpOnly?: boolean }
-
-async function preparePage(context: BrowserContext, input: Credentials): Promise<Page> {
-  const page = await context.newPage();
-  await page.setUserAgent(UA);
-  await page.evaluateOnNewDocument('globalThis.__name = (fn) => fn;');
-  await page.setRequestInterception(true);
-  page.on('request', request => {
-    if (request.isInterceptResolutionHandled()) return;
-    try {
-      const url = new URL(request.url());
-      const blocked = (url.protocol !== 'https:' && url.protocol !== 'data:' && url.protocol !== 'blob:') || (url.protocol === 'https:' && !allowedHost(url.hostname)) || ['image', 'media', 'font'].includes(request.resourceType());
-      void (blocked ? request.abort() : request.continue()).catch(() => {});
-    } catch { void request.abort().catch(() => {}); }
-  });
-  await page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-  // Dès que le menu applicatif est rendu, la navigation par libellé est
-  // possible : inutile d'attendre l'initialisation complète de la SPA.
-  await page.waitForFunction(() => document.querySelectorAll('.item-menu_niveau0').length >= 3, { timeout: 10000, polling: 100 });
-  return page;
-}
-
-type ModuleOutcome = {
-  module: ModuleName; report: ModuleReport;
-  html: string | null;
-};
-
-async function captureModule(browser: Browser, module: ModuleName, input: Credentials, cookies: InjectionCookie[], signal: AbortSignal): Promise<ModuleOutcome> {
+function applyHtml(module: ModuleName, html: string, data: PronoteData, pronoteUrl: string): number {
   const spec = navigation[module];
-  const started = Date.now();
-  let context: BrowserContext | undefined;
-  signal.throwIfAborted();
-  try {
-    context = await browser.createBrowserContext();
-    if (cookies.length) await context.setCookie(...cookies);
-    const page = await preparePage(context, input);
-    if (!await selectModule(page, module)) {
-      return { module, report: { module, status: 'unavailable', count: 0, durationMs: Date.now() - started, scope: spec.scope, code: 'TAB_UNAVAILABLE' }, html: null };
-    }
-    // Attente STRICTEMENT séquentielle en deux temps : d'abord le contenu, et
-    // seulement ensuite (en repli) la recherche d'un état vide. Cela élimine la
-    // course où un message de l'écran précédent provoque un faux « empty ».
-    const foundItems = await page.waitForSelector(spec.selector, { timeout: 3500 })
-      .then(() => true)
-      .catch(() => false);
-
-    if (foundItems) {
-      await pause(150); // stabilisation minimale du DOM
-      const html = await page.content();
-      const count = await page.evaluate((sel: string) => document.querySelectorAll(sel).length, spec.selector);
-      if (count > 0) {
-        return { module, report: { module, status: 'ok', count, durationMs: Date.now() - started, scope: spec.scope }, html };
-      }
-    }
-
-    // Repli : la rubrique est vide SEULEMENT si le message d'état vide est
-    // explicitement affiché après navigation
-    const empty = await page.evaluate((re: string) => {
-      const txt = (document.body?.innerText || '').slice(0, 50000);
-      return new RegExp(re, 'i').test(txt);
-    }, EMPTY_RE.source);
-
-    const html = await page.content();
-    if (empty) {
-      return { module, report: { module, status: 'empty', count: 0, durationMs: Date.now() - started, scope: spec.scope }, html: null };
-    }
-    return { module, report: { module, status: 'error', count: 0, durationMs: Date.now() - started, scope: spec.scope, code: 'CONTENT_NOT_CONFIRMED' }, html };
-  } finally {
-    await context?.close().catch(() => {});
-  }
+  if (module === 'emploiDuTemps') { const cours = parseTimetable(html); data.emploiDuTemps = { cours, totalCours: cours.length }; return cours.length; }
+  if (module === 'notes') { const grades = parseGrades(html); data.notes = { ...grades, totalNotes: grades.evaluations.length }; return grades.evaluations.length; }
+  if (module === 'agenda') { const devoirs = parseAssignments(html, pronoteUrl); data.agenda = { devoirs, totalDevoirs: devoirs.length }; return devoirs.length; }
+  if (module === 'ressources') { const seances = parseResources(html, pronoteUrl); data.ressources = { seances, totalSeances: seances.length }; return seances.length; }
+  const elements = parseEntries(html, spec.selector, module);
+  data[module as 'vieScolaire' | 'competences' | 'actualites' | 'cantine'] = { elements };
+  return elements.length;
 }
 
-async function bounded<T>(ms: number, code: string, run: () => Promise<T>): Promise<T> {
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      run(),
-      new Promise<T>((_, reject) => {
-        timeout = setTimeout(() => reject(new ApiError(code, 504, 'bounded', 'Délai dépassé pour cette étape.')), ms);
-      }),
-    ]);
-  } finally { if (timeout) clearTimeout(timeout); }
+function failedReport(module: ModuleName, started: number): ModuleReport {
+  return { module, status: 'error', count: 0, durationMs: Date.now() - started, scope: navigation[module].scope, code: 'CONTENT_NOT_CONFIRMED' };
+}
+
+async function captureModule(page: Page, module: ModuleName, data: PronoteData, pronoteUrl: string, timeoutMs: number): Promise<ModuleReport> {
+  const started = Date.now();
+  const spec = navigation[module];
+  if (!await selectModule(page, module)) {
+    return { module, status: 'unavailable', count: 0, durationMs: Date.now() - started, scope: spec.scope, code: 'TAB_UNAVAILABLE' };
+  }
+  const state = await page.waitForFunction((selector: string, hint: string) => {
+    if (document.querySelector(selector)) return 'ready';
+    return new RegExp(hint, 'i').test(document.body?.innerText || '') ? 'empty' : false;
+  }, { timeout: timeoutMs }, spec.selector, EMPTY_HINT).then(handle => handle.jsonValue() as Promise<'ready' | 'empty'>).catch(() => null);
+  const html = await page.content();
+  const count = applyHtml(module, html, data, pronoteUrl);
+  const emptyHint = state === 'empty' || (count === 0 && await page.evaluate((hint: string) => new RegExp(hint, 'i').test(document.body?.innerText || ''), EMPTY_HINT));
+  return {
+    module,
+    status: count > 0 ? 'ok' : emptyHint ? 'empty' : 'error',
+    count,
+    durationMs: Date.now() - started,
+    scope: spec.scope,
+    ...(count === 0 && !emptyHint ? { code: 'CONTENT_NOT_CONFIRMED' } : {}),
+  };
 }
 
 export async function extractPronote(input: Credentials, progress: (stage: string) => void = () => {}): Promise<ExtractionResult> {
   const started = Date.now();
   const authentication = { ent: false, pronote: false };
   const controller = new AbortController();
-  let browser: Browser | undefined;
+  let context: BrowserContext | undefined;
   let timedOut = false;
-  const deadline = setTimeout(() => { timedOut = true; controller.abort(); void browser?.close().catch(() => {}); }, 90000);
+  const deadline = setTimeout(() => { timedOut = true; controller.abort(); void context?.close().catch(() => {}); }, 45000);
   let stage = 'ent';
   try {
-    // Authentification ENT et démarrage du navigateur EN PARALLÈLE :
-    // les deux sont indépendants jusqu'à l'injection des cookies.
-    progress('ent+browser');
-    const [auth, launched] = await Promise.all([
-      authenticate(input, controller.signal),
-      puppeteer.launch({
-        headless: true,
-        timeout: 20000,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-extensions', '--disable-background-timer-throttling', '--no-first-run', '--hide-scrollbars'],
-        defaultViewport: { width: 1440, height: 1050 },
-      }),
-    ]);
-    const { jar, person } = auth;
-    browser = launched;
+    progress('ent');
+    const [auth] = await Promise.all([authenticate(input, controller.signal), ensureBrowser()]);
     authentication.ent = true;
-
-    // Les cookies ENT sont injectés dans CHAQUE contexte : chaque page ouvre
-    // sa propre session SSO, donc toutes peuvent charger Pronote simultanément.
-    const rawCookies = await jar.getCookies('https://ent77.seine-et-marne.fr/');
-    const cookies: InjectionCookie[] = rawCookies.map(c => ({ name: c.key, value: c.value, domain: c.domain || '.ent77.seine-et-marne.fr', path: c.path || '/', secure: c.secure, httpOnly: c.httpOnly }));
-
-    stage = 'pronote-parallel';
+    stage = 'browser';
     progress(stage);
+    const browser = await ensureBrowser();
+    context = await browser.createBrowserContext();
+    const session = context;
+    await attachCookies(session, auth.jar);
 
-    const fullData = emptyData(person);
-    const outcomes = await Promise.all(input.modules.map(module =>
-      bounded(60000, 'MODULE_TIMEOUT', () => captureModule(browser!, module, input, cookies, controller.signal))
-        .catch((err): ModuleOutcome => ({
-          module,
-          report: { module, status: 'error', count: 0, durationMs: Date.now() - started, scope: navigation[module].scope, code: err instanceof ApiError ? err.code : 'MODULE_FAILED' },
-          html: null,
-        }))
-    ));
-    authentication.pronote = outcomes.some(o => o.report.status !== 'unavailable' || o.html !== null);
-
-    const reports: ModuleReport[] = [];
-    for (const outcome of outcomes) {
-      const { module, report, html } = outcome;
-      let count = 0;
-      if (module === 'emploiDuTemps') { const parsed = html ? parseTimetable(html) : []; fullData.emploiDuTemps = { cours: parsed, totalCours: parsed.length }; count = parsed.length; }
-      else if (module === 'notes') { const parsed = html ? parseGrades(html) : { evaluations: [], periode: null, moyenneGenerale: null }; fullData.notes = { ...parsed, totalNotes: parsed.evaluations.length }; count = parsed.evaluations.length; }
-      else if (module === 'agenda') { const parsed = html ? parseAssignments(html, input.pronoteUrl) : []; fullData.agenda = { devoirs: parsed, totalDevoirs: parsed.length }; count = parsed.length; }
-      else if (module === 'ressources') { const parsed = html ? parseResources(html, input.pronoteUrl) : []; fullData.ressources = { seances: parsed, totalSeances: parsed.length }; count = parsed.length; }
-      else if (['vieScolaire', 'competences', 'actualites', 'cantine'].includes(module)) {
-        const parsed = html ? parseEntries(html, navigation[module].selector, module) : [];
-        fullData[module as 'vieScolaire' | 'competences' | 'actualites' | 'cantine'] = { elements: parsed };
-        count = parsed.length;
+    stage = 'pronote';
+    progress(stage);
+    const data = emptyData(auth.person);
+    const reports = new Map<ModuleName, ModuleReport>();
+    const pages = await Promise.all(input.modules.map(() => preparePage(session)));
+    try {
+      await Promise.all(pages.map(page => page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 8000 })));
+      const ready = await Promise.all(pages.map(page => waitPronoteReady(page, 7000)));
+      if (!ready.some(Boolean) || pages.every(page => new URL(page.url()).hostname !== new URL(input.pronoteUrl).hostname)) {
+        throw new ApiError('PRONOTE_AUTH_FAILED', 401, 'pronote', 'La session ENT est valide mais l’espace élève Pronote n’a pas été ouvert.');
       }
-      // Le statut réel vient du PARSING, pas seulement de la présence du sélecteur.
-      let status = report.status;
-      if (count > 0) status = 'ok';
-      else if (status === 'ok') status = report.code ? 'error' : 'error';
-      reports.push({ ...report, status, count });
+      authentication.pronote = true;
+      progress('modules');
+      await Promise.all(input.modules.map(async (module, index) => {
+        const begun = Date.now();
+        const page = pages[index];
+        if (!ready[index]) {
+          reports.set(module, failedReport(module, begun));
+          return;
+        }
+        reports.set(module, await withTimeout(captureModule(page, module, data, input.pronoteUrl, 1600), 3500, failedReport(module, begun)));
+      }));
+      const fallback = pages.find((_, index) => ready[index]);
+      if (fallback) {
+        for (const module of input.modules) {
+          const report = reports.get(module);
+          if (report && CORE.includes(module) && report.status === 'error') {
+            reports.set(module, await withTimeout(captureModule(fallback, module, data, input.pronoteUrl, 1600), 2500, report));
+          }
+        }
+      }
+    } finally {
+      await Promise.all(pages.map(page => page.close().catch(() => {})));
     }
 
-    const extracted = reports.some(m => m.status === 'ok');
-    const readable = reports.some(m => m.status === 'ok' || m.status === 'empty');
-    const success = readable;
-    const partial = reports.some(m => m.status === 'error' || m.status === 'unavailable');
+    const ordered = input.modules.map(module => reports.get(module)).filter((report): report is ModuleReport => Boolean(report));
+    const extracted = ordered.some(m => m.status === 'ok');
+    const readable = ordered.some(m => m.status === 'ok' || m.status === 'empty');
+    const partial = ordered.some(m => m.status === 'error' || m.status === 'unavailable');
     const result: ExtractionResult = {
       version: VERSION,
-      success,
-      status: success ? (partial ? 'partial' : 'done') : 'error',
+      success: readable,
+      status: readable ? (partial ? 'partial' : 'done') : 'error',
       timestamp: new Date().toISOString(),
       durationMs: Date.now() - started,
       authentication,
-      modules: reports,
-      data: fullData,
-      ...(!success ? { error: { code: 'EXTRACTION_EMPTY', message: 'Aucun module demandé n’a pu être lu de façon vérifiable.', stage: 'parsing' } } : {}),
+      modules: ordered,
+      data,
+      ...(!readable ? { error: { code: 'EXTRACTION_EMPTY', message: 'Aucun module demandé n’a pu être lu de façon vérifiable.', stage: 'parsing' } } : {}),
     };
-    if (!extracted && !reports.some(m => m.status === 'empty')) result.success = false;
+    if (!extracted && !ordered.some(m => m.status === 'empty')) result.success = false;
     assertNoCredentials(result);
     if (input.password.length >= 4 && JSON.stringify(result).includes(input.password)) throw new ApiError('UNSAFE_RESULT', 500, 'serialization', 'Un contenu sensible a été bloqué.');
     return result;
   } catch (error) {
     const err = timedOut
-      ? new ApiError('EXTRACTION_TIMEOUT', 504, stage, 'L’extraction a dépassé 90 secondes.')
-      : error instanceof ApiError
-        ? error
-        : new ApiError('UPSTREAM_ERROR', 502, stage, 'Le traitement a été interrompu à cette étape. Aucun détail de connexion n’est exposé.');
+      ? new ApiError('EXTRACTION_TIMEOUT', 504, stage, 'L’extraction a dépassé 45 secondes.')
+      : error instanceof ApiError ? error : new ApiError('UPSTREAM_ERROR', 502, stage, 'Le traitement a été interrompu à cette étape. Aucun détail de connexion n’est exposé.');
     return safeFailure(err, Date.now() - started, authentication);
   } finally {
     clearTimeout(deadline);
     controller.abort();
-    await browser?.close().catch(() => {});
+    await context?.close().catch(() => {});
   }
 }

@@ -1,20 +1,13 @@
-/**
- * The console proxy is open to any browser origin.
- *
- * It never reads cookies and never relies on the ambient authority of the
- * caller: each request carries its own credentials and receives exactly its
- * own response. That makes cross-site request forgery irrelevant here, so no
- * origin allow-list is needed.
- *
- * Kept as a named hook so the policy stays explicit and testable rather than
- * being silently removed from every call site.
- */
-export function isConsoleOriginAllowed(_request: Request): boolean {
-  return true;
+export function isConsoleOriginAllowed(request: Request): boolean {
+  const origin = request.headers.get('origin');
+  if (!origin) return true; // Server-to-server clients do not send Origin.
+  try {
+    const parsed = new URL(origin);
+    if (!['https:', 'http:'].includes(parsed.protocol) || parsed.origin !== origin) return false;
+    // Next constructs request.url from its internal listener. Compare the public
+    // authority exposed by the reverse proxy rather than that internal origin.
+    const forwarded = request.headers.get('x-forwarded-host')?.split(',')[0]?.trim();
+    const host = forwarded || request.headers.get('host') || new URL(request.url).host;
+    return parsed.host.toLowerCase() === host.toLowerCase();
+  } catch { return false; }
 }
-
-/** CORS headers for the console API routes. Open like the Worker itself. */
-export const OPEN_CORS: Record<string, string> = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Expose-Headers': 'X-Job-Token,Retry-After',
-};

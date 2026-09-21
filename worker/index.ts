@@ -90,7 +90,7 @@ export class Coordinator extends DurableObject<Env> {
         const h=await this.health();
         if(!h.runnerOnline&&!await this.dispatch('request')){this.ctx.storage.sql.exec('DELETE FROM jobs WHERE id = ?',id);return json({success:false,error:{code:'RUNNER_START_FAILED',message:'Le lancement du moteur a échoué.'}},503);}
         const immediate=this.read(id);
-        if(immediate&&!immediate.result)await new Promise<void>(resolve=>{const timer=setTimeout(finish,22000);const self=this;function finish(){clearTimeout(timer);self.waiters.delete(id);resolve();}this.waiters.set(id,finish);});
+        if(immediate&&!immediate.result)await new Promise<void>(resolve=>{const timer=setTimeout(finish,16000);const self=this;function finish(){clearTimeout(timer);self.waiters.delete(id);resolve();}this.waiters.set(id,finish);});
         const response=await this.snapshot(id);
         const out=await response.json<Record<string,unknown>>();
         return json({...out,jobId:id,jobToken,statusUrl:`/api/v1/job/${id}`},response.status,{'X-Job-Token':jobToken,'Retry-After':'3'});
@@ -130,18 +130,17 @@ export class Coordinator extends DurableObject<Env> {
 export default {
   async fetch(request:Request,env:Env):Promise<Response>{
     const url=new URL(request.url);
-    // Open API: every browser origin is allowed. Credentials always travel as
-    // JSON fields and never as cookies, so `Access-Control-Allow-Credentials`
-    // is intentionally omitted and `*` is safe here. The response does not
-    // vary by origin, so no `Vary` header is required.
+    // Public browser API: every origin may call the Worker. We deliberately do
+    // not enable Access-Control-Allow-Credentials; callers send explicit API
+    // keys/job capabilities, never ambient browser cookies.
     const cors:Record<string,string>={
       'Access-Control-Allow-Origin':'*',
       'Access-Control-Expose-Headers':'X-Job-Token,Retry-After',
     };
     const reply=(r:Response)=>{const h=new Headers(r.headers);for(const[k,v]of Object.entries(cors))h.set(k,v);return new Response(r.body,{status:r.status,headers:h});};
     try{
-      if(request.method==='OPTIONS')return reply(new Response(null,{status:204,headers:{'Access-Control-Allow-Methods':'GET,POST,DELETE,OPTIONS','Access-Control-Allow-Headers':'Content-Type,Authorization,X-API-Key,X-Job-Token','Access-Control-Expose-Headers':'X-Job-Token,Retry-After'}}));
-      if(request.method==='GET'&&['/','/docs'].includes(url.pathname))return reply(new Response(documentation,{headers:{'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",'X-Content-Type-Options':'nosniff','Cache-Control':'no-store'}}));
+      if(request.method==='OPTIONS')return reply(new Response(null,{status:204,headers:{'Access-Control-Allow-Methods':'GET,POST,DELETE,OPTIONS','Access-Control-Allow-Headers':'Content-Type,Authorization,X-API-Key,X-Job-Token','Access-Control-Max-Age':'86400'}}));
+      if(request.method==='GET'&&['/','/docs'].includes(url.pathname))return new Response(documentation,{headers:{'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",'X-Content-Type-Options':'nosniff'}});
       const stub=env.COORDINATOR.get(env.COORDINATOR.idFromName('pronote-v5'));
       if(['/api/v1/health','/api/health','/health','/api/v1/ready'].includes(url.pathname)){
         const r=await stub.fetch('https://internal/health');if(url.pathname.endsWith('/ready')){const h=await r.json<{runnerOnline:boolean}>();return reply(json(h,h.runnerOnline?200:503));}return reply(r);

@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { extractPronote } from '../src/pronote/engine';
+import { extractPronote, closeSharedBrowser } from '../src/pronote/engine';
 import { VERSION, safeFailure, ApiError, type Credentials, type ExtractionResult } from '../src/pronote/contracts';
 
 const url=(process.env.WORKER_URL||'https://pronote-api.hugdu77777.workers.dev').replace(/\/$/,'');
@@ -46,4 +46,4 @@ async function main(){
  }
  draining=true;await heartbeat();if(!stopping)await relay();log('runner_stopped',{active});
 }
-main().catch(()=>{log('runner_fatal');process.exitCode=1;}).finally(()=>clearInterval(timer));
+main().catch(()=>{log('runner_fatal');process.exitCode=1;}).finally(async()=>{clearInterval(timer);await closeSharedBrowser();});
