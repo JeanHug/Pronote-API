@@ -11,6 +11,8 @@
   var passInput = document.getElementById("p");
   var keyInput = document.getElementById("k");
   var urlInput = document.getElementById("pu");
+  var modeInput = document.getElementById("am");
+  var proxyInput = document.getElementById("px");
   var runBtn = document.getElementById("go");
   var stopBtn = document.getElementById("stop");
   var clearBtn = document.getElementById("clear");
@@ -57,6 +59,7 @@
   function curlSnippet(mods) {
     var body = { username: "VOTRE_IDENTIFIANT", password: "VOTRE_MOT_DE_PASSE", modules: mods };
     if (urlInput.value.trim()) body.pronoteUrl = urlInput.value.trim();
+    if (modeInput && modeInput.value !== "auto") body.authMode = modeInput.value;
     var lines = [
       "curl -X POST " + BASE + "/api/v1/scrape-pronote \\",
       '  -H "Content-Type: application/json" \\',
@@ -67,6 +70,7 @@
   }
   function jsSnippet(mods) {
     var body = { username: "VOTRE_IDENTIFIANT", password: "VOTRE_MOT_DE_PASSE", modules: mods };
+    if (modeInput && modeInput.value !== "auto") body.authMode = modeInput.value;
     var lines = [
       'const base = "' + BASE + '";',
       "",
@@ -149,11 +153,9 @@
     show("…", "Connexion a la passerelle.");
 
     var payload = { username: username, password: password, modules: mods };
-    var providerEl = document.getElementById("provider");
-    var accountEl = document.getElementById("account");
-    if (providerEl && providerEl.value) payload.provider = providerEl.value;
-    if (accountEl && accountEl.value) payload.account = accountEl.value;
     if (urlInput.value.trim()) payload.pronoteUrl = urlInput.value.trim();
+    if (modeInput && modeInput.value !== "auto") payload.authMode = modeInput.value;
+    if (proxyInput && proxyInput.value.trim()) payload.proxyUrl = proxyInput.value.trim();
 
     // Le mot de passe quitte le champ des que la requete part, meme si elle echoue.
     passInput.value = "";

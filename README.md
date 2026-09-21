@@ -18,7 +18,7 @@ There is no GitHub issue queue, no results published in issues, no Express serve
 - `GET /api/v1/health`: infrastructure state and last safe extraction summary. Not proof that scraping succeeds.
 - `GET /api/v1/ready`: HTTP 503 unless a recent v5 runner heartbeat exists.
 - `GET /api/v1/schema`: contract, modules, scope and retention.
-- `POST /api/v1/scrape-pronote`: body requires `username` and `password`. Optional `modules`, `pronoteUrl`, `entUrl`.
+- `POST /api/v1/scrape-pronote`: body requires `username` and `password` (or `sessionCookie`). Optional `authMode` (`"auto"`, `"educonnect_eleve"`, `"educonnect_parent"`, `"local"`), `proxyUrl`, `modules`, `pronoteUrl`, `entUrl`. Typical extraction latency is **~9–11 seconds** thanks to parallel module capture.
 - `GET /api/v1/job/:id`: requires `X-Job-Token`.
 - `DELETE /api/v1/job/:id`: requires the same `X-Job-Token` and immediately deletes the record.
 - `/docs`: human-readable documentation.
@@ -31,7 +31,7 @@ Modules: `emploiDuTemps`, `notes`, `agenda`, `ressources`, `vieScolaire`, `compe
 
 ### Scope and known limitations
 
-- `provider` is `ent77` by default, or `educonnect`. EduConnect accepts `account: "student"` (default) or `"parent"` and follows the official SAML path, then opens Pronote. MFA and mandatory account actions return an explicit error and are not bypassed.
+- Supports both **ENT77 local accounts** and **EduConnect National accounts** (student and parent/relative profiles via SAML bridge). EduConnect/MFA or a mandatory password/terms action returns an explicit error. If EduConnect triggers IP geoblocking (`EDUCONNECT_GEOBLOCKED`), configure a French proxy via `proxyUrl` or supply active session cookies via `sessionCookie`.
 - Reads the timetable week, grades period and contents currently loaded by Pronote. **Not a guarantee of a full school year or of unloaded/virtualized records.**
 - Grades with unavailable coefficients, missing dates or missing scales use `null`; no assumptions or invented averages.
 - Some document buttons do not expose a direct download URL. Their names are retained with `url: null`; session cookies are never returned.
