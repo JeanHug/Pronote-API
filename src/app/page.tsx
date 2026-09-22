@@ -18,7 +18,7 @@ export default function Page(){
  useEffect(()=>{void refresh();const t=setInterval(()=>void refresh(),30000);return()=>{clearInterval(t);controller.current?.abort();};},[refresh]);
  useEffect(()=>{if(!busy)return;const t=setInterval(()=>setElapsed(x=>x+1),1000);return()=>clearInterval(t);},[busy]);
  const latest=monitor?.checks[0];const reports=latest?.modules||monitor?.remote?.lastExtraction?.modules||[];
- const verified=latest?.success??monitor?.remote?.lastExtraction?.success;const online=monitor?.remote?.version==='5.0.0'&&monitor.remote.runnerOnline;
+ const verified=latest?.success??monitor?.remote?.lastExtraction?.success;const online=monitor?.remote?.runnerOnline===true;
  async function copy(){try{await navigator.clipboard.writeText(`${BASE}/api/v1/scrape-pronote`);setCopied(true);setTimeout(()=>setCopied(false),1800);}catch{setNotice('La copie n’est pas disponible dans ce navigateur.');}}
  async function execute(e:FormEvent){
   e.preventDefault();if(!modules.length){setNotice('Sélectionnez au moins une rubrique.');return;}
@@ -27,20 +27,22 @@ export default function Page(){
   const h:Record<string,string>={'Content-Type':'application/json'};if(apiKey)h['X-API-Key']=apiKey;
   const timer=setTimeout(()=>ctrl.abort(),240000);
   try{
-   const request=fetch('/api/pronote',{method:'POST',headers:h,body:JSON.stringify({username,password,modules,provider,account}),signal:ctrl.signal});setPassword('');
+   // Le navigateur appelle le Worker Cloudflare directement (CORS ouvert : Access-Control-Allow-Origin: *).
+   // Aucun proxy Next.js intermédiaire : cela supprime toute erreur INVALID_JOB_ACCESS.
+   const request=fetch(`${BASE}/api/v1/scrape-pronote`,{method:'POST',headers:h,body:JSON.stringify({username,password,modules,provider,account}),signal:ctrl.signal});setPassword('');
    let response=await request;let payload:Reply=await response.json();
    if(payload.jobId&&payload.jobToken)job.current={id:payload.jobId,token:payload.jobToken};
    while(response.status===202&&job.current){
     setPhase(payload.status==='queued'?'Demande en file · démarrage du moteur si nécessaire…':'Session isolée · lecture des rubriques Pronote…');
     await new Promise<void>((resolve,reject)=>{const timer=setTimeout(resolve,3000);ctrl.signal.addEventListener('abort',()=>{clearTimeout(timer);reject(new DOMException('Stopped','AbortError'));},{once:true});});
-    response=await fetch(`/api/pronote/jobs/${job.current.id}`,{headers:{...h,'X-Job-Token':job.current.token},signal:ctrl.signal,cache:'no-store'});payload=await response.json();
+    response=await fetch(`${BASE}/api/v1/job/${encodeURIComponent(job.current.id)}`,{headers:{...h,'X-Job-Token':job.current.token},signal:ctrl.signal,cache:'no-store'});payload=await response.json();
    }
    const {jobToken,...safe}=payload;void jobToken;setResult(safe);setPhase(payload.success?(payload.status==='partial'?'Extraction terminée · consultez les limites par rubrique.':'Extraction terminée.'):(payload.error?.message||'Le serveur a retourné une erreur.'));
    void refresh();
   }catch(error){setPhase(error instanceof DOMException&&error.name==='AbortError'?'Suivi arrêté. Le résultat serveur expire automatiquement.':'La passerelle n’a pas répondu. Réessayez après vérification du moteur.');}
   finally{clearTimeout(timer);setBusy(false);controller.current=null;}
  }
- async function erase(){if(!job.current){setResult(null);return;}try{const h:Record<string,string>={'X-Job-Token':job.current.token};if(apiKey)h['X-API-Key']=apiKey;const r=await fetch(`/api/pronote/jobs/${job.current.id}`,{method:'DELETE',headers:h});if(!r.ok)throw new Error();setResult(null);job.current=null;setPhase('Résultat supprimé du serveur et de cette console.');}catch{setNotice('Suppression non confirmée. Le résultat expire après cinq minutes.');}}
+  async function erase(){if(!job.current){setResult(null);return;}try{const h:Record<string,string>={'X-Job-Token':job.current.token};if(apiKey)h['X-API-Key']=apiKey;const r=await fetch(`${BASE}/api/v1/job/${encodeURIComponent(job.current.id)}`,{method:'DELETE',headers:h,cache:'no-store'});if(!r.ok)throw new Error();setResult(null);job.current=null;setPhase('Résultat supprimé du serveur et de cette console.');}catch{setNotice('Suppression non confirmée. Le résultat expire après cinq minutes.');}}
  function download(){if(!result)return;const url=URL.createObjectURL(new Blob([JSON.stringify(result,null,2)],{type:'application/json'}));const link=document.createElement('a');link.href=url;link.download='pronote-resultat.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
  return <div className="app-shell">
   <aside className="sidebar"><a className="brand" href="#top"><span className="brand-mark"><Code2 size={22}/></span><span>pronote<span className="brand-api"> / api</span></span></a><div className="workspace"><span className="workspace-icon">J</span><div><strong>JeanHug</strong><small>Espace développeur</small></div><span className="version-chip">v5</span></div><p className="nav-label">ESPACE DE TRAVAIL</p><nav><a href="#top" className="nav-current"><Layers size={17}/> Vue d’ensemble</a><a href="#console"><Terminal size={17}/> Console API <span className="nav-shortcut">↵</span></a><a href="#verification"><ShieldCheck size={17}/> Vérifications</a><a href={`${BASE}/docs`} target="_blank" rel="noreferrer"><FileJson size={17}/> Documentation <ArrowUpRight size={14}/></a></nav><div className="sidebar-bottom"><div className="safety-note"><LockKeyhole size={18}/><strong>Privé par conception</strong><p>Les identifiants restent côté serveur. Aucune donnée scolaire dans les journaux de test.</p></div><a className="repo-link" href="https://github.com/JeanHug/Pronote-API" target="_blank" rel="noreferrer"><GitBranch size={17}/> Voir le dépôt <ArrowUpRight size={14}/></a><small className="sidebar-footer">API non officielle · ENT77</small></div></aside>
