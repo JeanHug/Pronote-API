@@ -50,6 +50,41 @@ async function submit(page: Page): Promise<void> {
   await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
 }
 
+const ENT_PORTALS = ['ent77.seine-et-marne.fr', 'ent.seine-et-marne.fr'];
+const isEntPortal = (h: string) => ENT_PORTALS.includes(h);
+
+/**
+ * Navigate through the SSO bounce chain without letting it abort the whole job.
+ *
+ * The ENT portal (ent.seine-et-marne.fr) is an SPA that performs its own JS redirection while the
+ * previous navigation is still settling, which surfaces in Puppeteer as net::ERR_ABORTED or a
+ * TimeoutError. Those are *normal* for this chain: they mean the browser was moved elsewhere, not
+ * that the login failed. So we swallow them, give the chain time to settle, and judge the outcome by
+ * the hostname we actually reached — instead of letting a benign navigation hiccup become a 502.
+ */
+async function gotoTolerant(page: Page, url: string, attempts = 3, timeout = 15000): Promise<string> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+      // The portal keeps redirecting after domcontentloaded; let it finish before we judge.
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 4000 }).catch(() => {});
+      await new Promise(resolve => setTimeout(resolve, 400));
+      return page.url();
+    } catch (error) {
+      lastError = error;
+      // If the browser was redirected somewhere useful, treat the interruption as harmless.
+      const landed = host(page);
+      if (landed.endsWith('index-education.net') || isEntPortal(landed)) return page.url();
+      await new Promise(resolve => setTimeout(resolve, 600 * attempt));
+    }
+  }
+  // Last chance: the chain may have completed despite the final error.
+  const landed = host(page);
+  if (landed.endsWith('index-education.net') || isEntPortal(landed)) return page.url();
+  throw new ApiError('EDUCONNECT_NAVIGATION', 502, 'educonnect', `Navigation interrompue vers ${new URL(url).hostname} (${landed || 'hôte inconnu'}). Dernière erreur : ${lastError instanceof Error ? lastError.name : 'inconnue'}.`);
+}
+
 /**
  * Network filtering by the Ministry: EduConnect answers 302 -> assistance.phm.education.gouv.fr
  * ("Accès perturbé") for datacenter / VPN / non-French egress. It happens BEFORE any form is shown,
@@ -122,15 +157,16 @@ export async function loginEduConnect(page: Page, input: { username: string; pas
     // 3) Session established on ENT77: bounce through the CAS service to open Pronote.
     stage = 'pronote';
     const cas = `https://ent77.seine-et-marne.fr/cas/login?service=${encodeURIComponent(input.pronoteUrl)}`;
-    if (!host(page).endsWith('index-education.net')) {
-      await page.goto(cas, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    }
-    if (!host(page).endsWith('index-education.net')) {
-      await page.goto(input.pronoteUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    // Landing back on the ENT portal is a normal intermediate step of this chain, not a failure:
+    // the portal hands the CAS ticket over to Pronote a moment later. So we retry instead of aborting.
+    for (let bounce = 0; bounce < 3 && !host(page).endsWith('index-education.net'); bounce++) {
+      await gotoTolerant(page, cas);
+      if (host(page).endsWith('index-education.net')) break;
+      await gotoTolerant(page, input.pronoteUrl);
     }
     await guard(page);
     if (!host(page).endsWith('index-education.net')) {
-      throw new ApiError('EDUCONNECT_AUTH_FAILED', 401, 'educonnect', 'La session EduConnect n’a pas ouvert l’espace Pronote.');
+      throw new ApiError('EDUCONNECT_AUTH_FAILED', 401, 'educonnect', `La session EduConnect n’a pas ouvert l’espace Pronote (hôte atteint : ${host(page) || 'inconnu'}).`);
     }
     return { nomComplet: '', prenom: '', nom: '', classe: null, etablissement: null };
   } catch (error) {
@@ -139,6 +175,6 @@ export async function loginEduConnect(page: Page, input: { username: string; pas
     if (host(page) === BLOCK_HOST) {
       throw new ApiError('EDUCONNECT_NETWORK_BLOCKED', 503, 'educonnect', 'EduConnect refuse cette connexion depuis le réseau du moteur (« Accès perturbé »). Vos identifiants n’ont pas été évalués.');
     }
-    throw new ApiError('EDUCONNECT_NAVIGATION', 502, 'educonnect', `Navigation EduConnect interrompue (étape : ${stage}).`);
+    throw new ApiError('EDUCONNECT_NAVIGATION', 502, 'educonnect', `Navigation EduConnect interrompue (étape : ${stage}, hôte atteint : ${host(page) || 'inconnu'}).`);
   }
 }
