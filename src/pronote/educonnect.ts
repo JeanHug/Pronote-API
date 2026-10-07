@@ -156,11 +156,20 @@ export async function loginEduConnect(page: Page, input: { username: string; pas
 
     // 3) Session established on ENT77: bounce through the CAS service to open Pronote.
     stage = 'pronote';
-    const cas = `https://ent77.seine-et-marne.fr/cas/login?service=${encodeURIComponent(input.pronoteUrl)}`;
+    // Pronote requests its own CAS ticket with the ?p=daCas marker (observed in the real redirect
+    // chain: eleve.html -> cas/login?service=<eleve.html?p=daCas>). Reproducing that exact service
+    // URL is what makes the ENT issue a ticket instead of bouncing back to its portal.
+    const casTargets = [
+      `https://ent77.seine-et-marne.fr/cas/login?service=${encodeURIComponent(`${input.pronoteUrl}?p=daCas`)}`,
+      `https://ent77.seine-et-marne.fr/cas/login?service=${encodeURIComponent(input.pronoteUrl)}`,
+    ];
     // Landing back on the ENT portal is a normal intermediate step of this chain, not a failure:
     // the portal hands the CAS ticket over to Pronote a moment later. So we retry instead of aborting.
     for (let bounce = 0; bounce < 3 && !host(page).endsWith('index-education.net'); bounce++) {
-      await gotoTolerant(page, cas);
+      for (const target of casTargets) {
+        if (host(page).endsWith('index-education.net')) break;
+        await gotoTolerant(page, target);
+      }
       if (host(page).endsWith('index-education.net')) break;
       await gotoTolerant(page, input.pronoteUrl);
     }
